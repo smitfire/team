@@ -1,0 +1,5 @@
+- id: tool-agent-team
+  disabled: true
+- insert:
+    - id: ns-team
+      name: '@smitfire/team'

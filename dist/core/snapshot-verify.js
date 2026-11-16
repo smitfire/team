@@ -65,7 +65,7 @@ export function removeIsolatedWorktree(repoRoot, worktreePath, branch) {
         }
         catch { /* ignore */ }
     }
-    if (branch) {
+    if (branch?.startsWith('ns-work/')) {
         try {
             execFileSync('git', ['-C', absRepo, 'branch', '-D', branch], { stdio: ['ignore', 'pipe', 'pipe'] });
         }

@@ -405,7 +405,7 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
 
           if (worktreeInfo) {
             try {
-              execFileSync('git', ['-C', worktreeInfo.worktreePath, 'add', '-A'], {
+              execFileSync('git', ['-C', worktreeInfo.worktreePath, '-c', 'core.hooksPath=/dev/null', 'add', '-A'], {
                 stdio: ['ignore', 'pipe', 'pipe'],
               });
             } catch (err) {

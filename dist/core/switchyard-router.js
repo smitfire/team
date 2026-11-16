@@ -7,7 +7,7 @@ export const DEFAULT_SWITCHYARD_CONFIG = {
     },
     capableRoute: {
         provider: 'google-antigravity',
-        model: 'antigravity-gemini-3.1-pro',
+        model: 'antigravity-gemini-3.8-flash',
         reasoningEffort: 'high',
     },
     fallbackEfficientRoute: {

@@ -2,13 +2,14 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { basename, join, resolve } from 'node:path';
+const EXCLUDED_DIRS = new Set(['.git', 'node_modules', '.ns-dsh']);
 function hashDirectoryTree(root) {
     const hash = createHash('sha256');
     const files = [];
     const walk = (dir, relPrefix) => {
         for (const entry of readdirSync(dir, { withFileTypes: true })) {
-            if (entry.name === '.git' || entry.name === 'node_modules' || entry.name === '.ns-dsh')
+            if (EXCLUDED_DIRS.has(entry.name))
                 continue;
             const abs = join(dir, entry.name);
             const rel = relPrefix ? `${relPrefix}/${entry.name}` : entry.name;
@@ -34,27 +35,46 @@ export function createIsolatedWorktree(repoRoot, cardId, worktreeBaseDir = join(
     const safeId = cardId.replace(/[^A-Za-z0-9._-]/g, '-').slice(0, 40);
     const worktreePath = resolve(worktreeBaseDir, safeId);
     const branch = `ns-work/${safeId}`;
-    const headSha = execFileSync('git', ['-C', absRepo, '-c', 'core.hooksPath=/dev/null', 'rev-parse', 'HEAD'], {
-        encoding: 'utf8',
-    }).trim();
+    const headSha = execFileSync('git', ['-C', absRepo, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
     if (existsSync(worktreePath)) {
-        return { worktreePath, branch, headSha };
+        try {
+            const existing = execFileSync('git', ['-C', worktreePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+            if (existing === headSha)
+                return { worktreePath, branch, headSha };
+        }
+        catch {
+            /* recreate stale or corrupted worktree directory */
+        }
+        removeIsolatedWorktree(absRepo, worktreePath, branch);
     }
+    // Disable repo git hooks on ephemeral worktree checkout so untrusted repo hooks cannot execute implicitly.
     execFileSync('git', ['-C', absRepo, '-c', 'core.hooksPath=/dev/null', 'worktree', 'add', '-B', branch, worktreePath, 'HEAD'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
     return { worktreePath, branch, headSha };
 }
-export function removeIsolatedWorktree(repoRoot, worktreePath) {
+export function removeIsolatedWorktree(repoRoot, worktreePath, branch) {
+    const absRepo = resolve(repoRoot);
     try {
-        execFileSync('git', ['-C', resolve(repoRoot), '-c', 'core.hooksPath=/dev/null', 'worktree', 'remove', '--force', worktreePath], { stdio: ['ignore', 'pipe', 'pipe'] });
+        execFileSync('git', ['-C', absRepo, 'worktree', 'remove', '--force', worktreePath], {
+            stdio: ['ignore', 'pipe', 'pipe'],
+        });
     }
     catch {
         rmSync(worktreePath, { recursive: true, force: true });
+        try {
+            execFileSync('git', ['-C', absRepo, 'worktree', 'prune'], { stdio: ['ignore', 'pipe', 'pipe'] });
+        }
+        catch { /* ignore */ }
+    }
+    if (branch) {
+        try {
+            execFileSync('git', ['-C', absRepo, 'branch', '-D', branch], { stdio: ['ignore', 'pipe', 'pipe'] });
+        }
+        catch { /* ignore if branch already absent */ }
     }
 }
 /**
- * Hermetically copies the candidate worktree into a throwaway directory, runs the
- * verification command inside that copy (so tests can never mutate the reviewed tree),
- * and checks that the original worktree hash remained untouched.
+ * Copies the candidate tree into an ephemeral directory and executes a trusted
+ * host-configured verification command without allowing mutations back into the source tree.
  */
 export function verifySnapshotTests(worktreePath, testCommand, opts) {
     const absWorktree = resolve(worktreePath);
@@ -64,10 +84,7 @@ export function verifySnapshotTests(worktreePath, testCommand, opts) {
     try {
         cpSync(absWorktree, sandboxDir, {
             recursive: true,
-            filter: (src) => {
-                const name = src.slice(dirname(src).length + 1);
-                return name !== '.git' && name !== 'node_modules' && name !== '.ns-dsh';
-            },
+            filter: (src) => resolve(src) === absWorktree || !EXCLUDED_DIRS.has(basename(src)),
         });
         const nmSrc = join(absWorktree, 'node_modules');
         if (existsSync(nmSrc)) {

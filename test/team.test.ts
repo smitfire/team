@@ -168,6 +168,14 @@ test('DSH ns-team plugin wires Switchyard agent/pre-step model switching and Rev
     const ocrFail = parseOcrJsonReport(JSON.stringify({ comments: [{ path: 'a.ts', severity: 'high', category: 'bug', content: 'race' }] }));
     assert.equal(ocrFail.passed, false);
     assert.equal(ocrFail.blockingCount, 1);
+
+    const ocrMissing = parseOcrJsonReport(JSON.stringify({ status: 'error' }));
+    assert.equal(ocrMissing.ran, false);
+    assert.equal(ocrMissing.passed, false);
+
+    const unknownReviewer = selectCrossFamilyReviewer('custom-proxy', ['custom-proxy', 'other-proxy']);
+    assert.equal(unknownReviewer.crossFamily, false);
+    assert.match(unknownReviewer.warning ?? '', /unknown/);
   } finally {
     await fiber.dispose();
     rmSync(repo, { recursive: true, force: true });

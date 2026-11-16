@@ -16,5 +16,6 @@ export declare function parseOcrJsonReport(rawStdout: string): OcrGateResult;
 export declare function runOcrDiffReview(repoDir: string, baseRef?: string, opts?: {
     ocrBin?: string;
     effort?: 'low' | 'medium';
+    pathPrefix?: string;
 }): OcrGateResult;
 //# sourceMappingURL=ocr-runner.d.ts.map

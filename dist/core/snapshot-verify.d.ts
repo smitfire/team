@@ -11,11 +11,10 @@ export declare function createIsolatedWorktree(repoRoot: string, cardId: string,
     branch: string;
     headSha: string;
 };
-export declare function removeIsolatedWorktree(repoRoot: string, worktreePath: string): void;
+export declare function removeIsolatedWorktree(repoRoot: string, worktreePath: string, branch?: string): void;
 /**
- * Hermetically copies the candidate worktree into a throwaway directory, runs the
- * verification command inside that copy (so tests can never mutate the reviewed tree),
- * and checks that the original worktree hash remained untouched.
+ * Copies the candidate tree into an ephemeral directory and executes a trusted
+ * host-configured verification command without allowing mutations back into the source tree.
  */
 export declare function verifySnapshotTests(worktreePath: string, testCommand: string, opts?: {
     timeoutMs?: number;

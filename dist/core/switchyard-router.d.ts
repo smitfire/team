@@ -34,6 +34,7 @@ export interface SwitchyardConfig {
     deescalateAfterCleanSteps: number;
 }
 export declare const DEFAULT_SWITCHYARD_CONFIG: SwitchyardConfig;
+export declare function mergeSwitchyardConfig(partial?: Partial<SwitchyardConfig>): SwitchyardConfig;
 /**
  * NVIDIA NeMo Switchyard-inspired trajectory-aware StageRouter:
  * monitors recent tool errors, test failures, repeated calls, and review rejections

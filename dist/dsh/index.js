@@ -125,7 +125,8 @@ export function apply(ctx, rawConfig = {}) {
             return `<switchyard-router strategy="${strategy}" tier="${st.activeTier}" target="${route.provider}/${route.model}" escalations="${st.escalations}" deescalations="${st.deescalations}" />`;
         },
     });
-    // Track tool outcomes via SwitchyardStageRouter & detect worker stall loops (>3 reminder threshold -> abort at 5).
+    const log = ctx.logger(name);
+    // Track tool outcomes via SwitchyardStageRouter & abort stalled worker subagents after 5 identical consecutive calls.
     ctx.on('tools/result', (exec, result) => {
         if (!exec.agent)
             return;
@@ -169,16 +170,16 @@ export function apply(ctx, rawConfig = {}) {
         const sid = String(payload.agent.session.id);
         const nextRoute = pendingModelSwitch.get(sid);
         if (nextRoute && typeof payload.agent.model?.select === 'function') {
-            pendingModelSwitch.delete(sid);
             try {
                 payload.agent.model.select({
                     provider: nextRoute.provider,
                     model: nextRoute.model,
                     reasoningEffort: nextRoute.reasoningEffort,
                 });
+                pendingModelSwitch.delete(sid);
             }
-            catch {
-                /* ignore if session adapter pins a single static route */
+            catch (err) {
+                log.warn(`Switchyard model.select skipped for ${sid}: ${err instanceof Error ? err.message : String(err)}`);
             }
         }
         return next();
@@ -292,41 +293,46 @@ export function apply(ctx, rawConfig = {}) {
                     catch { /* ignore teardown error */ }
                 }
             }
-            if (workerError) {
-                if (worktreeInfo)
-                    removeIsolatedWorktree(repoRoot, worktreeInfo.worktreePath);
-                board?.moveCard({
-                    cardId,
-                    toColumn: 'blocked',
-                    actor: 'orchestrator',
-                    role: 'system',
-                    reason: `Worker failed: ${workerError}`,
-                });
-                return { ok: false, status: 'worker_failed', error: workerError };
-            }
-            // Run mandatory Review Gate before cleanup so worker diff & tests can be inspected.
-            if (worktreeInfo) {
-                try {
-                    execFileSync('git', ['-C', worktreeInfo.worktreePath, '-c', 'core.hooksPath=/dev/null', 'add', '-A'], {
-                        stdio: ['ignore', 'pipe', 'pipe'],
+            try {
+                if (workerError) {
+                    board?.moveCard({
+                        cardId,
+                        toColumn: 'blocked',
+                        actor: 'orchestrator',
+                        role: 'system',
+                        reason: `Worker failed: ${workerError}`,
                     });
+                    return { ok: false, status: 'worker_failed', error: workerError };
                 }
-                catch { /* ignore */ }
+                if (worktreeInfo) {
+                    try {
+                        execFileSync('git', ['-C', worktreeInfo.worktreePath, 'add', '-A'], {
+                            stdio: ['ignore', 'pipe', 'pipe'],
+                        });
+                    }
+                    catch (err) {
+                        log.warn(`worktree git add -A warning for ${cardId}: ${err instanceof Error ? err.message : String(err)}`);
+                    }
+                }
+                const review = runReviewGate({
+                    cardId,
+                    repoDir: workerDir,
+                    baseRef: baseSha,
+                    testCommand: typeof args.testCommand === 'string' && args.testCommand.trim() ? args.testCommand : defaultTestCommand,
+                    authorProvider,
+                    authorSessionId: String(exec.agent.session.id),
+                });
+                return {
+                    ok: review.passed,
+                    workerSummary,
+                    review,
+                };
             }
-            const review = runReviewGate({
-                cardId,
-                repoDir: workerDir,
-                baseRef: baseSha,
-                testCommand: typeof args.testCommand === 'string' && args.testCommand.trim() ? args.testCommand : defaultTestCommand,
-                authorProvider,
-                authorSessionId: String(exec.agent.session.id),
-            });
-            return {
-                ok: review.passed,
-                workerSummary,
-                worktreePath: worktreeInfo?.worktreePath,
-                review,
-            };
+            finally {
+                if (worktreeInfo) {
+                    removeIsolatedWorktree(repoRoot, worktreeInfo.worktreePath, worktreeInfo.branch);
+                }
+            }
         },
     }));
     ctx.tools.register(defineTool({

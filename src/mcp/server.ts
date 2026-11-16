@@ -28,7 +28,7 @@ const MCP_TOOLS = [
   },
   {
     name: 'review_worktree_gate',
-    description: 'Run hermetic snapshot test verification + OCR review + cross-family reviewer pairing on a candidate repo dir.',
+    description: 'Run snapshot test verification + OCR review + cross-family reviewer pairing on a candidate repo dir.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -60,24 +60,20 @@ export async function startMcpServer(workspaceRoot = process.cwd()): Promise<voi
   const write = (msg: unknown) => process.stdout.write(`${JSON.stringify(msg)}\n`);
   const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
 
-  for await (const line of rl) {
-    if (!line.trim()) continue;
-    let req: { id?: string | number | null; method?: string; params?: Record<string, unknown> };
+  const handleRequest = async (req: { id?: string | number | null; method?: unknown; params?: Record<string, unknown> }) => {
+    const id = req.id ?? null;
     try {
-      req = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    if (req.id === undefined || req.method === undefined) continue;
-    try {
+      if (typeof req.method !== 'string' || !req.method) {
+        throw new RpcError(-32600, 'invalid JSON-RPC request: missing method');
+      }
       if (req.method === 'initialize') {
         write({
           jsonrpc: '2.0',
-          id: req.id,
+          id,
           result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'ns-team', version: '0.1.0' } },
         });
       } else if (req.method === 'tools/list') {
-        write({ jsonrpc: '2.0', id: req.id, result: { tools: MCP_TOOLS } });
+        write({ jsonrpc: '2.0', id, result: { tools: MCP_TOOLS } });
       } else if (req.method === 'tools/call') {
         const name = String(req.params?.name ?? '');
         const args = (req.params?.arguments ?? {}) as Record<string, unknown>;
@@ -92,8 +88,13 @@ export async function startMcpServer(workspaceRoot = process.cwd()): Promise<voi
             outputPreview: typeof args.outputPreview === 'string' ? args.outputPreview : undefined,
           });
         } else if (name === 'review_worktree_gate') {
-          const snapshot = verifySnapshotTests(workspaceRoot, String(args.testCommand ?? 'npm test'));
-          const ocr = args.runOcr === false ? { ran: false, passed: true, blockingCount: 0, findings: [] } : runOcrDiffReview(workspaceRoot, String(args.baseRef ?? 'HEAD~1'));
+          const skipOcr = args.runOcr === false;
+          const [snapshot, ocr] = await Promise.all([
+            Promise.resolve().then(() => verifySnapshotTests(workspaceRoot, String(args.testCommand ?? 'npm test'))),
+            skipOcr
+              ? Promise.resolve({ ran: false, passed: true, blockingCount: 0, findings: [] })
+              : Promise.resolve().then(() => runOcrDiffReview(workspaceRoot, String(args.baseRef ?? 'HEAD~1'))),
+          ]);
           const reviewer = selectCrossFamilyReviewer(String(args.authorProvider ?? 'google-antigravity'));
           result = { passed: snapshot.passed && snapshot.worktreeIntact && ocr.passed, snapshot, ocr, reviewer };
         } else if (name === 'export_switchyard_config') {
@@ -101,13 +102,34 @@ export async function startMcpServer(workspaceRoot = process.cwd()): Promise<voi
         } else {
           throw new RpcError(-32601, `unknown tool: ${name}`);
         }
-        write({ jsonrpc: '2.0', id: req.id, result: { content: [{ type: 'text', text: JSON.stringify(result) }] } });
+        write({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(result) }] } });
       } else {
         throw new RpcError(-32601, `method not found: ${req.method}`);
       }
     } catch (error) {
-      write({ jsonrpc: '2.0', id: req.id, error: { code: error instanceof RpcError ? error.code : -32000, message: error instanceof Error ? error.message : String(error) } });
+      write({
+        jsonrpc: '2.0',
+        id,
+        error: { code: error instanceof RpcError ? error.code : -32000, message: error instanceof Error ? error.message : String(error) },
+      });
     }
+  };
+
+  for await (const line of rl) {
+    if (!line.trim()) continue;
+    let req: { id?: string | number | null; method?: unknown; params?: Record<string, unknown> };
+    try {
+      req = JSON.parse(line);
+    } catch {
+      write({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } });
+      continue;
+    }
+    if (!req || typeof req !== 'object' || Array.isArray(req)) {
+      write({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Invalid Request' } });
+      continue;
+    }
+    if (req.id === undefined) continue;
+    void handleRequest(req);
   }
 }
 

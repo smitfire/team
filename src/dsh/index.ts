@@ -5,7 +5,7 @@ import { promisify } from 'node:util';
 import { Context } from '@deepseek-ai/cordis';
 import z from '@deepseek-ai/schemastery';
 import { defineTool } from '@deepseek-ai/dsh-tools';
-import type { Agent, AgentOptions } from '@deepseek-ai/dsh-agent';
+import type { Agent, AgentOptions, RequestErrorAction } from '@deepseek-ai/dsh-agent';
 import type {} from '@deepseek-ai/dsh-subagent';
 import type {} from '@deepseek-ai/dsh-system-prompt';
 import {
@@ -137,23 +137,24 @@ interface ContextApiLike {
 function sleepWithSignal(
   ms: number,
   signal: AbortSignal | undefined,
-  pendingTimers: Set<ReturnType<typeof setTimeout>>,
+  pendingSleeps: Set<() => void>,
 ): Promise<void> {
   if (ms <= 0 || signal?.aborted) return Promise.resolve();
   return new Promise((resolve) => {
-    const onAbort = () => {
-      clearTimeout(timer);
-      pendingTimers.delete(timer);
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      pendingSleeps.delete(finish);
+      signal?.removeEventListener('abort', finish);
       resolve();
     };
-    const timer = setTimeout(() => {
-      pendingTimers.delete(timer);
-      signal?.removeEventListener('abort', onAbort);
-      resolve();
-    }, ms);
+    timer = setTimeout(finish, ms);
     timer.unref?.();
-    pendingTimers.add(timer);
-    signal?.addEventListener('abort', onAbort, { once: true });
+    pendingSleeps.add(finish);
+    signal?.addEventListener('abort', finish, { once: true });
   });
 }
 
@@ -193,6 +194,7 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
   const activeDispatchCardIds = new Set<string>();
   const watchdogCancelling = new Set<string>();
   const pendingTimers = new Set<ReturnType<typeof setTimeout>>();
+  const pendingSleeps = new Set<() => void>();
   const pendingFollowupBySession = new Map<string, ReturnType<typeof setTimeout>>();
   let globalHitlPending = 0;
   let startupReconciled = false;
@@ -354,11 +356,7 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
 
   const log = ctx.logger(name);
   ctx.on('agent/status', ({ agent, status }) => {
-    const sid = String(agent.session.id);
-    if (status === 'idle') {
-      watchdogCancelling.delete(sid);
-    }
-    watchdog.setRunning(sid, status === 'running');
+    watchdog.setRunning(String(agent.session.id), status === 'running');
   });
 
   ctx.on('agent/assistant-stream', ({ agent, frame }) => {
@@ -366,7 +364,10 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
     watchdog.touch(sid);
     if (frame.type === 'chunk' && frame.chunk.type === 'finish') {
       const reason = frame.chunk.reason;
-      const wasWatchdogCancel = watchdogCancelling.delete(sid);
+      const wasWatchdogCancel = watchdogCancelling.has(sid);
+      if (reason.kind !== 'aborted') {
+        watchdogCancelling.delete(sid);
+      }
       watchdog.recordFinishReason(sid, reason.kind);
       if (reason.kind === 'aborted' && !wasWatchdogCancel && isUserAbortFailure((reason as { failure?: unknown }).failure)) {
         watchdog.markUserCancelled(sid, true);
@@ -428,7 +429,8 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
     }
   });
 
-  ctx.on('agent/request-error', async (payload, next) => {
+  // Uses @deepseek-ai/dsh-agent RequestErrorAction waterfall contract ({ kind: 'retry' } vs delegating to next()).
+  ctx.on('agent/request-error', async (payload, next): Promise<RequestErrorAction> => {
     const sid = String(payload.agent.session.id);
     const fObj =
       payload.failure && typeof payload.failure === 'object' ? (payload.failure as { code?: unknown; message?: unknown }) : undefined;
@@ -441,7 +443,7 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
         `${payload.provider}:${fCode}${fMsg ? `:${fMsg}` : ''}`,
       );
       if (decision.allowed) {
-        await sleepWithSignal(retryBackoffMs * Math.max(1, decision.count), payload.signal, pendingTimers);
+        await sleepWithSignal(retryBackoffMs * Math.max(1, decision.count), payload.signal, pendingSleeps);
         if (payload.signal?.aborted) {
           watchdog.refundRequestRetry(sid);
         } else {
@@ -546,6 +548,8 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
     if (sweepTimer) clearInterval(sweepTimer);
     for (const t of pendingTimers) clearTimeout(t);
     pendingTimers.clear();
+    for (const finishSleep of [...pendingSleeps]) finishSleep();
+    pendingSleeps.clear();
     pendingFollowupBySession.clear();
     watchdogCancelling.clear();
     globalHitlPending = 0;
@@ -729,7 +733,7 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
               capableOverride = {
                 provider: capRoute.provider,
                 model: capRoute.model,
-                reasoningEffort: capRoute.reasoningEffort as AgentOptions['reasoningEffort'],
+                reasoningEffort: capRoute.reasoningEffort as never,
               };
               watchdog.recordEvent({
                 sessionId: String(exec.agent.session.id),

@@ -42,6 +42,10 @@ export class ProgressWatch {
     return this.repeats;
   }
 
+  isTripped(): boolean {
+    return this.tripped;
+  }
+
   reset(): void {
     this.previous = null;
     this.repeats = 0;
@@ -117,7 +121,7 @@ const RETRYABLE_CODES = new Set([
   'EAI_AGAIN',
 ]);
 
-const USER_ABORT_CODES = new Set(['USER_ABORT', 'ABORT', 'ABORTED']);
+const USER_ABORT_CODES = new Set(['USER_ABORT', 'USER_ABORTED', 'USER_CANCELLED', 'USER_CANCELED', 'ABORT', 'ABORTED']);
 
 const NON_RETRYABLE_CODES = new Set([
   'AUTH',
@@ -136,14 +140,14 @@ const RETRYABLE_MSG_RE =
   /\b(?:rate[-_ ]?limit|too many requests|timed? ?out|etimedout|econnreset|fetch failed|overloaded|stream closed|temporarily unavailable|internal server error|bad gateway|gateway timeout)\b/i;
 
 const NON_RETRYABLE_MSG_RE =
-  /\b(?:unauthorized|invalid api key|forbidden|cuga|cuga_policy_deny|permission|validation|user cancel(?:led|ed)?|aborted by user|user_abort)\b/i;
+  /\b(?:unauthorized|invalid api key|forbidden|cuga|cuga_policy_deny|permission|validation|user cancel(?:led|ed)?|aborted by user|user_abort(?:ed)?|user_cancel(?:led|ed)?)\b/i;
 
 /**
  * Shared predicate identifying user-initiated cancellation / abort failure codes.
  */
 export function isUserAbortFailure(failure: unknown): boolean {
   if (typeof failure === 'string') {
-    return /\b(?:USER_ABORT|USER_CANCEL(?:LED|ED)?|ABORTED BY USER)\b/i.test(failure);
+    return /\b(?:USER_ABORT(?:ED)?|USER_CANCEL(?:LED|ED)?|user cancel(?:led|ed)?|aborted by user)\b/i.test(failure);
   }
   if (!failure || typeof failure !== 'object') return false;
   const obj = failure as Record<string, unknown>;
@@ -289,7 +293,6 @@ export class StallWatchdog {
     if (running) {
       st.userCancelled = false;
       st.lastFinishReason = undefined;
-      st.autoContinuations = 0;
     }
   }
 
@@ -455,7 +458,7 @@ export class StallWatchdog {
     stallTimeoutMs: number,
     extraBusyCheck?: (sessionId: string) => boolean,
   ): string[] {
-    if (stallTimeoutMs <= 0) return [];
+    if (!Number.isFinite(stallTimeoutMs) || stallTimeoutMs <= 0) return [];
     const stalled: string[] = [];
     for (const st of this.sessions.values()) {
       if (!st.running) continue;

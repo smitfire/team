@@ -44,23 +44,26 @@ export const Config = z.object({
     watchdogFollowupSettleMs: z.number().default(TEAM_DEFAULTS.watchdogFollowupSettleMs),
     maxDispatchAttempts: z.number().default(TEAM_DEFAULTS.maxDispatchAttempts),
 });
-function sleepWithSignal(ms, signal, pendingTimers) {
+function sleepWithSignal(ms, signal, pendingSleeps) {
     if (ms <= 0 || signal?.aborted)
         return Promise.resolve();
     return new Promise((resolve) => {
-        const onAbort = () => {
-            clearTimeout(timer);
-            pendingTimers.delete(timer);
+        let settled = false;
+        let timer;
+        const finish = () => {
+            if (settled)
+                return;
+            settled = true;
+            if (timer)
+                clearTimeout(timer);
+            pendingSleeps.delete(finish);
+            signal?.removeEventListener('abort', finish);
             resolve();
         };
-        const timer = setTimeout(() => {
-            pendingTimers.delete(timer);
-            signal?.removeEventListener('abort', onAbort);
-            resolve();
-        }, ms);
+        timer = setTimeout(finish, ms);
         timer.unref?.();
-        pendingTimers.add(timer);
-        signal?.addEventListener('abort', onAbort, { once: true });
+        pendingSleeps.add(finish);
+        signal?.addEventListener('abort', finish, { once: true });
     });
 }
 function renderJson(_args, value) {
@@ -96,6 +99,7 @@ export function apply(ctx, rawConfig = {}) {
     const activeDispatchCardIds = new Set();
     const watchdogCancelling = new Set();
     const pendingTimers = new Set();
+    const pendingSleeps = new Set();
     const pendingFollowupBySession = new Map();
     let globalHitlPending = 0;
     let startupReconciled = false;
@@ -240,18 +244,17 @@ export function apply(ctx, rawConfig = {}) {
     });
     const log = ctx.logger(name);
     ctx.on('agent/status', ({ agent, status }) => {
-        const sid = String(agent.session.id);
-        if (status === 'idle') {
-            watchdogCancelling.delete(sid);
-        }
-        watchdog.setRunning(sid, status === 'running');
+        watchdog.setRunning(String(agent.session.id), status === 'running');
     });
     ctx.on('agent/assistant-stream', ({ agent, frame }) => {
         const sid = String(agent.session.id);
         watchdog.touch(sid);
         if (frame.type === 'chunk' && frame.chunk.type === 'finish') {
             const reason = frame.chunk.reason;
-            const wasWatchdogCancel = watchdogCancelling.delete(sid);
+            const wasWatchdogCancel = watchdogCancelling.has(sid);
+            if (reason.kind !== 'aborted') {
+                watchdogCancelling.delete(sid);
+            }
             watchdog.recordFinishReason(sid, reason.kind);
             if (reason.kind === 'aborted' && !wasWatchdogCancel && isUserAbortFailure(reason.failure)) {
                 watchdog.markUserCancelled(sid, true);
@@ -312,6 +315,7 @@ export function apply(ctx, rawConfig = {}) {
             }
         }
     });
+    // Uses @deepseek-ai/dsh-agent RequestErrorAction waterfall contract ({ kind: 'retry' } vs delegating to next()).
     ctx.on('agent/request-error', async (payload, next) => {
         const sid = String(payload.agent.session.id);
         const fObj = payload.failure && typeof payload.failure === 'object' ? payload.failure : undefined;
@@ -320,7 +324,7 @@ export function apply(ctx, rawConfig = {}) {
         if (!payload.signal?.aborted && isRetryableUpstreamFailure(payload.failure)) {
             const decision = watchdog.consumeRequestRetry(sid, maxRequestErrorRetries, `${payload.provider}:${fCode}${fMsg ? `:${fMsg}` : ''}`);
             if (decision.allowed) {
-                await sleepWithSignal(retryBackoffMs * Math.max(1, decision.count), payload.signal, pendingTimers);
+                await sleepWithSignal(retryBackoffMs * Math.max(1, decision.count), payload.signal, pendingSleeps);
                 if (payload.signal?.aborted) {
                     watchdog.refundRequestRetry(sid);
                 }
@@ -419,6 +423,9 @@ export function apply(ctx, rawConfig = {}) {
         for (const t of pendingTimers)
             clearTimeout(t);
         pendingTimers.clear();
+        for (const finishSleep of [...pendingSleeps])
+            finishSleep();
+        pendingSleeps.clear();
         pendingFollowupBySession.clear();
         watchdogCancelling.clear();
         globalHitlPending = 0;

@@ -12,6 +12,7 @@ export declare class ProgressWatch {
     constructor(limit?: number);
     observe(toolName: string, argsSummary: string, outputPreview?: string): boolean;
     getRepeatCount(): number;
+    isTripped(): boolean;
     reset(): void;
 }
 export type WatchdogEventKind = 'max_tokens_continue' | 'request_error_retry' | 'idle_stall_recover' | 'subagent_cold_resume' | 'board_orphan_reconciled' | 'loop_cap_reached';

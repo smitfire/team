@@ -289,9 +289,9 @@ test('ProgressWatch, StallWatchdog exemptions, max-tokens steer, request-error r
       agent: fakeAgent,
       frame: { type: 'chunk', chunk: { type: 'finish', reason: { kind: 'max-tokens' } } },
     } as never);
-    await ctx.waterfall('agent/turn-stopping', { agent: fakeAgent, turn: 1, signal: new AbortController().signal } as never, async () => {});
-    await ctx.waterfall('agent/turn-stopping', { agent: fakeAgent, turn: 1, signal: new AbortController().signal } as never, async () => {});
-    await ctx.waterfall('agent/turn-stopping', { agent: fakeAgent, turn: 1, signal: new AbortController().signal } as never, async () => {});
+    await ctx.serial('agent/turn-stopping', { agent: fakeAgent, turn: 1, signal: new AbortController().signal } as never);
+    await ctx.serial('agent/turn-stopping', { agent: fakeAgent, turn: 1, signal: new AbortController().signal } as never);
+    await ctx.serial('agent/turn-stopping', { agent: fakeAgent, turn: 1, signal: new AbortController().signal } as never);
     assert.equal(steered.length, 2);
 
     // 2. Retryable request-error returns { kind: 'retry' }; non-retryable AUTH delegates

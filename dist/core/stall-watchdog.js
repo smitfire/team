@@ -36,6 +36,9 @@ export class ProgressWatch {
     getRepeatCount() {
         return this.repeats;
     }
+    isTripped() {
+        return this.tripped;
+    }
     reset() {
         this.previous = null;
         this.repeats = 0;
@@ -54,7 +57,7 @@ const RETRYABLE_CODES = new Set([
     'ENETUNREACH',
     'EAI_AGAIN',
 ]);
-const USER_ABORT_CODES = new Set(['USER_ABORT', 'ABORT', 'ABORTED']);
+const USER_ABORT_CODES = new Set(['USER_ABORT', 'USER_ABORTED', 'USER_CANCELLED', 'USER_CANCELED', 'ABORT', 'ABORTED']);
 const NON_RETRYABLE_CODES = new Set([
     'AUTH',
     'PERMISSION',
@@ -67,13 +70,13 @@ const NON_RETRYABLE_CODES = new Set([
 const RETRYABLE_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 const NON_RETRYABLE_STATUSES = new Set([400, 401, 403, 404, 422]);
 const RETRYABLE_MSG_RE = /\b(?:rate[-_ ]?limit|too many requests|timed? ?out|etimedout|econnreset|fetch failed|overloaded|stream closed|temporarily unavailable|internal server error|bad gateway|gateway timeout)\b/i;
-const NON_RETRYABLE_MSG_RE = /\b(?:unauthorized|invalid api key|forbidden|cuga|cuga_policy_deny|permission|validation|user cancel(?:led|ed)?|aborted by user|user_abort)\b/i;
+const NON_RETRYABLE_MSG_RE = /\b(?:unauthorized|invalid api key|forbidden|cuga|cuga_policy_deny|permission|validation|user cancel(?:led|ed)?|aborted by user|user_abort(?:ed)?|user_cancel(?:led|ed)?)\b/i;
 /**
  * Shared predicate identifying user-initiated cancellation / abort failure codes.
  */
 export function isUserAbortFailure(failure) {
     if (typeof failure === 'string') {
-        return /\b(?:USER_ABORT|USER_CANCEL(?:LED|ED)?|ABORTED BY USER)\b/i.test(failure);
+        return /\b(?:USER_ABORT(?:ED)?|USER_CANCEL(?:LED|ED)?|user cancel(?:led|ed)?|aborted by user)\b/i.test(failure);
     }
     if (!failure || typeof failure !== 'object')
         return false;
@@ -222,7 +225,6 @@ export class StallWatchdog {
         if (running) {
             st.userCancelled = false;
             st.lastFinishReason = undefined;
-            st.autoContinuations = 0;
         }
     }
     beginToolCall(sessionId, now = Date.now()) {
@@ -337,7 +339,7 @@ export class StallWatchdog {
      * Identify silently stalled sessions while exempting in-flight tool executions and pending HITL prompts.
      */
     checkStalledSessions(now, stallTimeoutMs, extraBusyCheck) {
-        if (stallTimeoutMs <= 0)
+        if (!Number.isFinite(stallTimeoutMs) || stallTimeoutMs <= 0)
             return [];
         const stalled = [];
         for (const st of this.sessions.values()) {

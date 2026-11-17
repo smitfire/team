@@ -3,7 +3,9 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import z from '@deepseek-ai/schemastery';
 import { defineTool } from '@deepseek-ai/dsh-tools';
-import { createIsolatedWorktree, generateSwitchyardRoutesToml, isRetryableUpstreamFailure, makeWatchdogUserMessage, removeIsolatedWorktree, runOcrDiffReview, selectCrossFamilyReviewer, StallWatchdog, SwitchyardStageRouter, verifySnapshotTests, } from '../core/index.js';
+import { createIsolatedWorktree, DEFAULT_PROGRESS_WATCH_LIMIT, generateSwitchyardRoutesToml, isRetryableUpstreamFailure, isUserAbortFailure, makeWatchdogUserMessage, removeIsolatedWorktree, runOcrDiffReview, selectCrossFamilyReviewer, StallWatchdog, SwitchyardStageRouter, verifySnapshotTests, } from '../core/index.js';
+const WATCHDOG_FOLLOWUP_SETTLE_MS = 150;
+const MAX_DISPATCH_ATTEMPTS = 2;
 export const name = 'ns-team';
 export const inject = ['tools', 'agents', 'subagents', 'systemPrompt'];
 export const Config = z.object({
@@ -84,7 +86,7 @@ export function apply(ctx, rawConfig = {}) {
                 continue;
             if (activeDispatchCardIds.has(card.id))
                 continue;
-            if (card.agentSessionId && liveIds.has(card.agentSessionId))
+            if (!card.agentSessionId || liveIds.has(card.agentSessionId))
                 continue;
             const moved = board.moveCard({
                 cardId: card.id,
@@ -92,7 +94,7 @@ export function apply(ctx, rawConfig = {}) {
                 actor: 'ns-team-watchdog',
                 role: 'system',
                 expectedRevision: card.revision,
-                reason: `Watchdog startup reconciliation: worker session ${card.agentSessionId ?? 'none'} is no longer active`,
+                reason: `Watchdog startup reconciliation: worker session ${card.agentSessionId} is no longer active`,
             });
             if (moved.ok) {
                 reconciled += 1;
@@ -101,10 +103,10 @@ export function apply(ctx, rawConfig = {}) {
                     author: 'ns-team-watchdog',
                     role: 'system',
                     kind: 'status',
-                    body: `Moved orphaned in_progress card back to ready (prior session: ${card.agentSessionId ?? 'none'}).`,
+                    body: `Moved orphaned in_progress card back to ready (prior session: ${card.agentSessionId}).`,
                 });
                 watchdog.recordEvent({
-                    sessionId: card.agentSessionId ?? card.id,
+                    sessionId: card.agentSessionId,
                     kind: 'board_orphan_reconciled',
                     detail: `Reconciled orphaned in_progress card "${card.id}" -> ready`,
                 });
@@ -213,11 +215,8 @@ export function apply(ctx, rawConfig = {}) {
         if (frame.type === 'chunk' && frame.chunk.type === 'finish') {
             const reason = frame.chunk.reason;
             watchdog.recordFinishReason(sid, reason.kind);
-            if (reason.kind === 'aborted') {
-                const code = reason.failure?.code;
-                if (code === 'USER_ABORT' || code === 'ABORTED') {
-                    watchdog.markUserCancelled(sid, true);
-                }
+            if (reason.kind === 'aborted' && isUserAbortFailure(reason.failure)) {
+                watchdog.markUserCancelled(sid, true);
             }
         }
     });
@@ -233,6 +232,7 @@ export function apply(ctx, rawConfig = {}) {
                 watchdog.endToolCall(sid);
         }
     });
+    // Intentionally untyped casts because approval/request and user-questions/request are optional plugins loaded by host profiles.
     for (const hitlEvent of ['approval/request', 'user-questions/request']) {
         ctx.on(hitlEvent, (async (payload, next) => {
             const sid = payload?.agent
@@ -271,8 +271,11 @@ export function apply(ctx, rawConfig = {}) {
     });
     ctx.on('agent/request-error', async (payload, next) => {
         const sid = String(payload.agent.session.id);
+        const fObj = payload.failure && typeof payload.failure === 'object' ? payload.failure : undefined;
+        const fCode = typeof fObj?.code === 'string' ? fObj.code : 'unknown';
+        const fMsg = typeof fObj?.message === 'string' ? fObj.message.slice(0, 120) : '';
         if (!payload.signal?.aborted && isRetryableUpstreamFailure(payload.failure)) {
-            const decision = watchdog.consumeRequestRetry(sid, maxRequestErrorRetries, `${payload.provider}:${payload.failure.code}:${payload.failure.message}`);
+            const decision = watchdog.consumeRequestRetry(sid, maxRequestErrorRetries, `${payload.provider}:${fCode}${fMsg ? `:${fMsg}` : ''}`);
             if (decision.allowed) {
                 await sleepWithSignal(retryBackoffMs * Math.max(1, decision.count), payload.signal, pendingTimers);
                 if (!payload.signal?.aborted) {
@@ -301,8 +304,13 @@ export function apply(ctx, rawConfig = {}) {
     };
     const runWatchdogSweep = () => {
         if (!startupReconciled && getBoard()?.snapshot) {
-            startupReconciled = true;
-            reconcileOrphanedCards();
+            try {
+                reconcileOrphanedCards();
+                startupReconciled = true;
+            }
+            catch (err) {
+                log.warn(`Orphan card reconciliation deferred due to error: ${err instanceof Error ? err.message : String(err)}`);
+            }
         }
         const stalledIds = watchdog.checkStalledSessions(Date.now(), stallTimeoutMs, () => hasPendingInteractivePrompt());
         for (const sid of stalledIds) {
@@ -328,15 +336,16 @@ export function apply(ctx, rawConfig = {}) {
             }
             const timer = setTimeout(() => {
                 pendingTimers.delete(timer);
-                if (typeof liveAgent.followup === 'function') {
-                    try {
-                        liveAgent.followup(makeWatchdogUserMessage(`[Auto-Resume Watchdog ${decision.count}/${maxStallRecoveries}]: Previous turn stalled with no stream or tool progress. Inspect current workspace state and resume remaining work.`));
-                    }
-                    catch (err) {
-                        log.warn(`Watchdog followup skipped for ${sid}: ${err instanceof Error ? err.message : String(err)}`);
-                    }
+                const stillLive = ctx.agents.get(sid) ?? ctx.agents.list().find((a) => String(a.session.id) === sid);
+                if (!stillLive || typeof stillLive.followup !== 'function')
+                    return;
+                try {
+                    stillLive.followup(makeWatchdogUserMessage(`[Auto-Resume Watchdog ${decision.count}/${maxStallRecoveries}]: Previous turn stalled with no stream or tool progress. Inspect current workspace state and resume remaining work.`));
                 }
-            }, 150);
+                catch (err) {
+                    log.warn(`Watchdog followup skipped for ${sid}: ${err instanceof Error ? err.message : String(err)}`);
+                }
+            }, WATCHDOG_FOLLOWUP_SETTLE_MS);
             timer.unref?.();
             pendingTimers.add(timer);
         }
@@ -367,8 +376,8 @@ export function apply(ctx, rawConfig = {}) {
             const sig = `${exec.name}:${argsStr}`;
             if (sig === watch.lastSig) {
                 watch.repeats += 1;
-                if (watch.repeats >= 5) {
-                    watch.controller.abort(new Error(`worker stalled repeating ${exec.name} 5 times`));
+                if (watch.repeats >= DEFAULT_PROGRESS_WATCH_LIMIT) {
+                    watch.controller.abort(new Error(`worker stalled repeating ${exec.name} ${DEFAULT_PROGRESS_WATCH_LIMIT} times`));
                 }
             }
             else {
@@ -492,9 +501,9 @@ export function apply(ctx, rawConfig = {}) {
             let resumedFromCheckpoint = false;
             activeDispatchCardIds.add(cardId);
             try {
-                for (let attempt = 1; attempt <= 2; attempt += 1) {
+                for (let attempt = 1; attempt <= MAX_DISPATCH_ATTEMPTS; attempt += 1) {
                     workerError = undefined;
-                    const isResumeAttempt = attempt === 2;
+                    const isResumeAttempt = attempt === MAX_DISPATCH_ATTEMPTS;
                     let promptText = String(args.task);
                     let capableOverride;
                     if (isResumeAttempt) {
@@ -526,13 +535,15 @@ export function apply(ctx, rawConfig = {}) {
                             author: 'ns-team-watchdog',
                             role: 'system',
                             kind: 'status',
-                            body: `Cold-resuming stalled/failed worker (attempt 2/2) using ${capRoute.provider}/${capRoute.model}.`,
+                            body: `Cold-resuming stalled/failed worker (attempt ${attempt}/${MAX_DISPATCH_ATTEMPTS}) using ${capRoute.provider}/${capRoute.model}.`,
                         });
                         promptText = [
-                            `[AUTO-RESUME CHECKPOINT — ATTEMPT 2/2]`,
-                            `Previous worker attempt did not finish cleanly${workerSummary ? ` (partial output: ${workerSummary.slice(0, 400)})` : ''}.`,
-                            `Current worktree status:\n${gitStatus || '(clean working tree)'}`,
-                            `Inspect the existing worktree state and complete the remaining work:\n${String(args.task)}`,
+                            `[AUTO-RESUME CHECKPOINT — ATTEMPT ${attempt}/${MAX_DISPATCH_ATTEMPTS}]`,
+                            'The previous worker attempt did not complete. Untrusted workspace status block follows; inspect files directly before editing.',
+                            '<untrusted-git-status>',
+                            gitStatus || '(clean working tree)',
+                            '</untrusted-git-status>',
+                            `Inspect the existing worktree state and complete the task:\n${String(args.task)}`,
                         ].join('\n');
                     }
                     let activation;
@@ -581,9 +592,21 @@ export function apply(ctx, rawConfig = {}) {
                             catch { /* ignore teardown error */ }
                         }
                     }
-                    if (!workerError || exec.signal.aborted) {
+                    const deterministicOrAborted = exec.signal.aborted ||
+                        (workerError !== undefined && /\b(?:USER_ABORT|ABORTED|AUTH|PERMISSION|CUGA_POLICY_DENY)\b/i.test(workerError));
+                    if (!workerError || deterministicOrAborted) {
                         break;
                     }
+                }
+                if (exec.signal.aborted) {
+                    board?.moveCard({
+                        cardId,
+                        toColumn: 'ready',
+                        actor: 'orchestrator',
+                        role: 'system',
+                        reason: 'Parent aborted worker execution; returned card to ready',
+                    });
+                    return { ok: false, status: 'aborted', resumedFromCheckpoint };
                 }
                 if (workerError) {
                     board?.moveCard({

@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { Agent } from '@deepseek-ai/dsh-agent';
 
+export const DEFAULT_PROGRESS_WATCH_LIMIT = 4;
+
 /**
  * Loop-detection watchdog inspired by `dsh-workbench`'s ProgressWatch:
  * fingerprints consecutive `[toolName, argsSummary, outputPreview]` tuples.
@@ -10,7 +12,7 @@ export class ProgressWatch {
   private previous: string | null = null;
   private repeats = 0;
 
-  constructor(limit = 4) {
+  constructor(limit = DEFAULT_PROGRESS_WATCH_LIMIT) {
     if (!Number.isSafeInteger(limit) || limit < 2) {
       throw new Error(`ProgressWatch limit must be an integer >= 2 (got ${limit})`);
     }
@@ -93,6 +95,8 @@ interface InternalSessionState {
   progressWatch: ProgressWatch;
 }
 
+type BudgetCounterField = 'autoContinuations' | 'requestErrorRetries' | 'stallRecoveries';
+
 const RETRYABLE_CODES = new Set([
   'RATE_LIMIT',
   'TIMEOUT',
@@ -106,29 +110,46 @@ const RETRYABLE_CODES = new Set([
   'EAI_AGAIN',
 ]);
 
+export const USER_ABORT_CODES = new Set(['USER_ABORT', 'ABORT', 'ABORTED']);
+
 const NON_RETRYABLE_CODES = new Set([
   'AUTH',
   'PERMISSION',
   'CUGA',
   'CUGA_POLICY_DENY',
-  'USER_ABORT',
-  'ABORT',
-  'ABORTED',
   'VALIDATION',
   'INVALID_REQUEST',
+  ...USER_ABORT_CODES,
 ]);
 
 const RETRYABLE_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 
+const RETRYABLE_MSG_RE =
+  /\b(?:rate[-_ ]?limit|too many requests|timed? ?out|etimedout|econnreset|fetch failed|overloaded|stream closed|temporarily unavailable|internal server error|bad gateway|gateway timeout|408|429|500|502|503|504)\b/i;
+
+const NON_RETRYABLE_MSG_RE =
+  /\b(?:unauthorized|invalid api key|forbidden|cuga|user cancel(?:led|ed)?|aborted by user)\b/i;
+
+/**
+ * Shared predicate identifying user-initiated cancellation / abort failure codes.
+ */
+export function isUserAbortFailure(failure: unknown): boolean {
+  if (!failure || typeof failure !== 'object') return false;
+  const obj = failure as Record<string, unknown>;
+  const name = typeof obj.name === 'string' ? obj.name : '';
+  const code = typeof obj.code === 'string' ? obj.code.toUpperCase() : '';
+  return name === 'AbortError' || USER_ABORT_CODES.has(code);
+}
+
 /**
  * Classify upstream LLM/transport failures for bounded automatic retry.
+ * Explicit structured error codes and HTTP statuses take precedence over message text.
  */
 export function isRetryableUpstreamFailure(errOrFailure: unknown): boolean {
   if (!errOrFailure) return false;
   if (typeof errOrFailure === 'string') {
-    const lower = errOrFailure.toLowerCase();
-    if (/auth|unauthorized|forbidden|permission|cuga|user cancelled|aborted by user/.test(lower)) return false;
-    return /rate.?limit|429|timeout|etimedout|econnreset|fetch failed|overloaded|stream closed|502|503|504|500|server.?error/.test(lower);
+    if (NON_RETRYABLE_MSG_RE.test(errOrFailure)) return false;
+    return RETRYABLE_MSG_RE.test(errOrFailure);
   }
   if (typeof errOrFailure !== 'object') return false;
   const obj = errOrFailure as Record<string, unknown>;
@@ -138,26 +159,26 @@ export function isRetryableUpstreamFailure(errOrFailure: unknown): boolean {
   const message = typeof obj.message === 'string' ? obj.message : '';
 
   if (name === 'AbortError' || NON_RETRYABLE_CODES.has(code) || code.startsWith('CUGA_')) return false;
-  if (/abort|user cancel|unauthorized|invalid api key|forbidden|cuga/i.test(message)) return false;
   if (RETRYABLE_CODES.has(code)) return true;
   if (status !== undefined && RETRYABLE_STATUSES.has(status)) return true;
-  return /rate.?limit|too many requests|timeout|etimedout|econnreset|fetch failed|overloaded|stream closed|temporarily unavailable|internal server error|bad gateway|gateway timeout/i.test(
-    message,
-  );
+  if (NON_RETRYABLE_MSG_RE.test(message)) return false;
+  return RETRYABLE_MSG_RE.test(message);
 }
 
 /**
- * Construct an immutable frozen DSH UserMessage without adding new package deps.
+ * Construct an immutable frozen DSH UserMessage structurally matching `Agent['steer']`.
+ * Cast is isolated here because `@deepseek-ai/dsh-agent` leaves `UserMessage.id` branded at type level.
  */
 export function makeWatchdogUserMessage(text: string): Parameters<Agent['steer']>[0] {
   const block = Object.freeze({ type: 'text' as const, text });
   const source = Object.freeze({ kind: 'user' as const });
-  return Object.freeze({
+  const candidate = Object.freeze({
     id: randomUUID(),
     role: 'user' as const,
     content: Object.freeze([block]),
     source,
-  }) as unknown as Parameters<Agent['steer']>[0];
+  });
+  return candidate as unknown as Parameters<Agent['steer']>[0];
 }
 
 /**
@@ -168,10 +189,12 @@ export class StallWatchdog {
   private readonly sessions = new Map<string, InternalSessionState>();
   private readonly events: WatchdogEvent[] = [];
   private readonly maxEvents: number;
+  private readonly progressWatchLimit: number;
   private totalEvents = 0;
 
-  constructor(opts: { maxEvents?: number } = {}) {
+  constructor(opts: { maxEvents?: number; progressWatchLimit?: number } = {}) {
     this.maxEvents = opts.maxEvents ?? 100;
+    this.progressWatchLimit = opts.progressWatchLimit ?? DEFAULT_PROGRESS_WATCH_LIMIT;
   }
 
   private ensure(sessionId: string, now = Date.now()): InternalSessionState {
@@ -187,7 +210,7 @@ export class StallWatchdog {
         requestErrorRetries: 0,
         stallRecoveries: 0,
         userCancelled: false,
-        progressWatch: new ProgressWatch(4),
+        progressWatch: new ProgressWatch(this.progressWatchLimit),
       };
       this.sessions.set(sessionId, st);
     }
@@ -209,9 +232,12 @@ export class StallWatchdog {
     };
   }
 
-  touch(sessionId: string, now = Date.now()): void {
+  touch(sessionId: string, now = Date.now(), resetStallBudget = false): void {
     const st = this.ensure(sessionId, now);
     st.lastActivityAt = now;
+    if (resetStallBudget) {
+      st.stallRecoveries = 0;
+    }
   }
 
   setRunning(sessionId: string, running: boolean, now = Date.now()): void {
@@ -220,6 +246,7 @@ export class StallWatchdog {
     st.lastActivityAt = now;
     if (running) {
       st.userCancelled = false;
+      st.lastFinishReason = undefined;
     }
   }
 
@@ -230,13 +257,16 @@ export class StallWatchdog {
   }
 
   endToolCall(sessionId: string, now = Date.now()): void {
-    const st = this.ensure(sessionId, now);
+    const st = this.sessions.get(sessionId);
+    if (!st) return;
     st.inFlightToolCalls = Math.max(0, st.inFlightToolCalls - 1);
     st.lastActivityAt = now;
   }
 
   setPendingHitl(sessionId: string, delta: number, now = Date.now()): void {
-    const st = this.ensure(sessionId, now);
+    if (delta < 0 && !this.sessions.has(sessionId)) return;
+    const st = delta > 0 ? this.ensure(sessionId, now) : this.sessions.get(sessionId);
+    if (!st) return;
     st.pendingHitlPrompts = Math.max(0, st.pendingHitlPrompts + delta);
     st.lastActivityAt = now;
   }
@@ -251,11 +281,13 @@ export class StallWatchdog {
     const st = this.ensure(sessionId, now);
     st.lastFinishReason = reason;
     st.lastActivityAt = now;
-    if (reason === 'stop') {
+    if (reason === 'stop' || reason === 'tool-calls') {
       st.autoContinuations = 0;
       st.requestErrorRetries = 0;
       st.stallRecoveries = 0;
-      st.progressWatch.reset();
+      if (reason === 'stop') {
+        st.progressWatch.reset();
+      }
     }
   }
 
@@ -277,8 +309,45 @@ export class StallWatchdog {
         detail: `Repeated identical tool outcome (${toolName}) reached limit ${st.progressWatch.limit}`,
         timestamp: now,
       });
+    } else {
+      // Distinct forward tool progress resets stall recovery counter so long runs retain protection.
+      st.stallRecoveries = 0;
     }
     return triggered;
+  }
+
+  private consumeBudget(
+    sessionId: string,
+    field: BudgetCounterField,
+    maxAllowed: number,
+    successKind: WatchdogEventKind,
+    capLabel: string,
+    detail: string,
+    now: number,
+  ): { allowed: boolean; count: number } {
+    const st = this.ensure(sessionId, now);
+    const current = st[field];
+    if (st.userCancelled || current >= maxAllowed) {
+      this.recordEvent({
+        sessionId,
+        kind: 'loop_cap_reached',
+        attempt: current,
+        detail: `${capLabel} (${current}/${maxAllowed}): ${detail}`,
+        timestamp: now,
+      });
+      return { allowed: false, count: current };
+    }
+    const next = current + 1;
+    st[field] = next;
+    st.lastActivityAt = now;
+    this.recordEvent({
+      sessionId,
+      kind: successKind,
+      attempt: next,
+      detail,
+      timestamp: now,
+    });
+    return { allowed: true, count: next };
   }
 
   consumeAutoContinuation(
@@ -287,27 +356,15 @@ export class StallWatchdog {
     detail = 'max-tokens finish reached',
     now = Date.now(),
   ): { allowed: boolean; count: number } {
-    const st = this.ensure(sessionId, now);
-    st.lastActivityAt = now;
-    if (st.userCancelled || st.autoContinuations >= maxAutoContinuations) {
-      this.recordEvent({
-        sessionId,
-        kind: 'loop_cap_reached',
-        attempt: st.autoContinuations,
-        detail: `Auto-continuation capped (${st.autoContinuations}/${maxAutoContinuations}): ${detail}`,
-        timestamp: now,
-      });
-      return { allowed: false, count: st.autoContinuations };
-    }
-    st.autoContinuations += 1;
-    this.recordEvent({
+    return this.consumeBudget(
       sessionId,
-      kind: 'max_tokens_continue',
-      attempt: st.autoContinuations,
+      'autoContinuations',
+      maxAutoContinuations,
+      'max_tokens_continue',
+      'Auto-continuation capped',
       detail,
-      timestamp: now,
-    });
-    return { allowed: true, count: st.autoContinuations };
+      now,
+    );
   }
 
   consumeRequestRetry(
@@ -316,27 +373,15 @@ export class StallWatchdog {
     detail: string,
     now = Date.now(),
   ): { allowed: boolean; count: number } {
-    const st = this.ensure(sessionId, now);
-    st.lastActivityAt = now;
-    if (st.userCancelled || st.requestErrorRetries >= maxRequestErrorRetries) {
-      this.recordEvent({
-        sessionId,
-        kind: 'loop_cap_reached',
-        attempt: st.requestErrorRetries,
-        detail: `Request retry capped (${st.requestErrorRetries}/${maxRequestErrorRetries}): ${detail}`,
-        timestamp: now,
-      });
-      return { allowed: false, count: st.requestErrorRetries };
-    }
-    st.requestErrorRetries += 1;
-    this.recordEvent({
+    return this.consumeBudget(
       sessionId,
-      kind: 'request_error_retry',
-      attempt: st.requestErrorRetries,
+      'requestErrorRetries',
+      maxRequestErrorRetries,
+      'request_error_retry',
+      'Request retry capped',
       detail,
-      timestamp: now,
-    });
-    return { allowed: true, count: st.requestErrorRetries };
+      now,
+    );
   }
 
   /**
@@ -368,27 +413,15 @@ export class StallWatchdog {
     detail = 'silent stream/turn stall detected',
     now = Date.now(),
   ): { allowed: boolean; count: number } {
-    const st = this.ensure(sessionId, now);
-    st.lastActivityAt = now;
-    if (st.userCancelled || st.stallRecoveries >= maxStallRecoveries) {
-      this.recordEvent({
-        sessionId,
-        kind: 'loop_cap_reached',
-        attempt: st.stallRecoveries,
-        detail: `Stall recovery capped (${st.stallRecoveries}/${maxStallRecoveries}): ${detail}`,
-        timestamp: now,
-      });
-      return { allowed: false, count: st.stallRecoveries };
-    }
-    st.stallRecoveries += 1;
-    this.recordEvent({
+    return this.consumeBudget(
       sessionId,
-      kind: 'idle_stall_recover',
-      attempt: st.stallRecoveries,
+      'stallRecoveries',
+      maxStallRecoveries,
+      'idle_stall_recover',
+      'Stall recovery capped',
       detail,
-      timestamp: now,
-    });
-    return { allowed: true, count: st.stallRecoveries };
+      now,
+    );
   }
 
   recordEvent(input: Omit<WatchdogEvent, 'id' | 'timestamp'> & { timestamp?: number }): WatchdogEvent {

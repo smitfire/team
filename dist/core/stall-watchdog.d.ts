@@ -1,4 +1,5 @@
 import type { Agent } from '@deepseek-ai/dsh-agent';
+export declare const DEFAULT_PROGRESS_WATCH_LIMIT = 4;
 /**
  * Loop-detection watchdog inspired by `dsh-workbench`'s ProgressWatch:
  * fingerprints consecutive `[toolName, argsSummary, outputPreview]` tuples.
@@ -41,12 +42,19 @@ export interface WatchdogStatusSnapshot {
     readonly sessions: readonly WatchdogSessionSnapshot[];
     readonly session?: WatchdogSessionSnapshot;
 }
+export declare const USER_ABORT_CODES: Set<string>;
+/**
+ * Shared predicate identifying user-initiated cancellation / abort failure codes.
+ */
+export declare function isUserAbortFailure(failure: unknown): boolean;
 /**
  * Classify upstream LLM/transport failures for bounded automatic retry.
+ * Explicit structured error codes and HTTP statuses take precedence over message text.
  */
 export declare function isRetryableUpstreamFailure(errOrFailure: unknown): boolean;
 /**
- * Construct an immutable frozen DSH UserMessage without adding new package deps.
+ * Construct an immutable frozen DSH UserMessage structurally matching `Agent['steer']`.
+ * Cast is isolated here because `@deepseek-ai/dsh-agent` leaves `UserMessage.id` branded at type level.
  */
 export declare function makeWatchdogUserMessage(text: string): Parameters<Agent['steer']>[0];
 /**
@@ -57,13 +65,15 @@ export declare class StallWatchdog {
     private readonly sessions;
     private readonly events;
     private readonly maxEvents;
+    private readonly progressWatchLimit;
     private totalEvents;
     constructor(opts?: {
         maxEvents?: number;
+        progressWatchLimit?: number;
     });
     private ensure;
     private toSnapshot;
-    touch(sessionId: string, now?: number): void;
+    touch(sessionId: string, now?: number, resetStallBudget?: boolean): void;
     setRunning(sessionId: string, running: boolean, now?: number): void;
     beginToolCall(sessionId: string, now?: number): void;
     endToolCall(sessionId: string, now?: number): void;
@@ -71,6 +81,7 @@ export declare class StallWatchdog {
     markUserCancelled(sessionId: string, cancelled?: boolean, now?: number): void;
     recordFinishReason(sessionId: string, reason: string, now?: number): void;
     observeToolOutcome(sessionId: string, toolName: string, argsSummary: string, outputPreview?: string, now?: number): boolean;
+    private consumeBudget;
     consumeAutoContinuation(sessionId: string, maxAutoContinuations: number, detail?: string, now?: number): {
         allowed: boolean;
         count: number;

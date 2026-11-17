@@ -10,9 +10,12 @@ import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
 import {
   createIsolatedWorktree,
   generateSwitchyardRoutesToml,
+  isRetryableUpstreamFailure,
   parseOcrJsonReport,
+  ProgressWatch,
   removeIsolatedWorktree,
   selectCrossFamilyReviewer,
+  StallWatchdog,
   SwitchyardStageRouter,
   verifySnapshotTests,
 } from '../dist/core/index.js';
@@ -176,6 +179,168 @@ test('DSH ns-team plugin wires Switchyard agent/pre-step model switching and Rev
     const unknownReviewer = selectCrossFamilyReviewer('custom-proxy', ['custom-proxy', 'other-proxy']);
     assert.equal(unknownReviewer.crossFamily, false);
     assert.match(unknownReviewer.warning ?? '', /unknown/);
+  } finally {
+    await fiber.dispose();
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('ProgressWatch, StallWatchdog exemptions, max-tokens steer, request-error retry, subagent cold-resume & orphan board reconcile', async () => {
+  const pw = new ProgressWatch(4);
+  assert.equal(pw.observe('read', 'a.ts', 'x'), false);
+  assert.equal(pw.observe('read', 'a.ts', 'x'), false);
+  assert.equal(pw.observe('read', 'a.ts', 'x'), false);
+  assert.equal(pw.observe('read', 'a.ts', 'x'), true);
+  assert.equal(pw.observe('edit', 'b.ts', 'y'), false);
+
+  assert.equal(isRetryableUpstreamFailure({ code: 'RATE_LIMIT', status: 429, message: 'slow down' }), true);
+  assert.equal(isRetryableUpstreamFailure({ message: 'ECONNRESET stream closed' }), true);
+  assert.equal(isRetryableUpstreamFailure({ code: 'AUTH', status: 401, message: 'bad token' }), false);
+  assert.equal(isRetryableUpstreamFailure({ code: 'CUGA_POLICY_DENY', message: 'blocked' }), false);
+  assert.equal(isRetryableUpstreamFailure({ name: 'AbortError', message: 'aborted' }), false);
+
+  const wd = new StallWatchdog();
+  wd.setRunning('s-tool', true, 1000);
+  wd.beginToolCall('s-tool', 1000);
+  assert.deepEqual(wd.checkStalledSessions(200_000, 10_000), []);
+  wd.endToolCall('s-tool', 200_000);
+  wd.setPendingHitl('s-tool', 1, 200_000);
+  assert.deepEqual(wd.checkStalledSessions(400_000, 10_000), []);
+  wd.setPendingHitl('s-tool', -1, 400_000);
+  assert.deepEqual(wd.checkStalledSessions(500_000, 10_000), ['s-tool']);
+
+  const repo = mkdtempSync(join(tmpdir(), 'ns-team-watchdog-'));
+  execFileSync('git', ['-C', repo, 'init', '-b', 'main'], { stdio: 'ignore' });
+  execFileSync('git', ['-C', repo, 'config', 'user.email', 'test@example.com'], { stdio: 'ignore' });
+  execFileSync('git', ['-C', repo, 'config', 'user.name', 'Test'], { stdio: 'ignore' });
+  writeFileSync(join(repo, 'app.mjs'), 'export const ok = true;\n');
+  execFileSync('git', ['-C', repo, 'add', '.'], { stdio: 'ignore' });
+  execFileSync('git', ['-C', repo, '-c', 'core.hooksPath=/dev/null', 'commit', '-m', 'init'], { stdio: 'ignore' });
+
+  const steered: unknown[] = [];
+  const followups: unknown[] = [];
+  const cancels: unknown[] = [];
+  const fakeAgent = {
+    id: 'sess-wd',
+    session: { id: 'sess-wd', meta: { cwd: repo } },
+    options: { provider: 'google-antigravity', model: 'antigravity-gemini-3.8-flash' },
+    model: {
+      current: () => ({ provider: 'google-antigravity', model: 'antigravity-gemini-3.8-flash' }),
+      select: () => {},
+    },
+    steer: (m: unknown) => steered.push(m),
+    followup: (m: unknown) => followups.push(m),
+    cancel: (c: unknown, opts: unknown) => cancels.push({ c, opts }),
+  } as never;
+
+  const ctx = new Context();
+  await ctx.plugin(SystemPrompt);
+  await ctx.plugin(ToolsService);
+  ctx.provide('agents', {
+    get: (id: unknown) => (String(id) === 'sess-wd' ? fakeAgent : undefined),
+    list: () => [fakeAgent],
+  });
+  let subAttempts = 0;
+  ctx.provide('subagents', {
+    startActivation: async () => {
+      subAttempts += 1;
+      const attemptNo = subAttempts;
+      return {
+        childId: `child-${attemptNo}`,
+        result:
+          attemptNo === 1
+            ? Promise.resolve({ output: [{ type: 'text', text: 'partial work' }], stopReason: 'error', diagnostic: 'stream dropped' })
+            : Promise.resolve({ output: [{ type: 'text', text: 'completed cleanly' }], stopReason: 'completed' }),
+        dispose: async () => {},
+      };
+    },
+  });
+
+  const orphanMoves: unknown[] = [];
+  ctx.provide('nsBoard', {
+    proposeCard: () => ({ card: { id: 'c1', revision: 1 }, scopeConflicts: [] }),
+    moveCard: (req: unknown) => {
+      orphanMoves.push(req);
+      return { ok: true, status: 'moved', card: { id: 'c1', revision: 2 } };
+    },
+    addComment: () => ({}),
+    getCard: () => ({ id: 'c1', revision: 1, owner: 'worker' }),
+    snapshot: () => ({
+      cards: [{ id: 'orphan-1', column: 'in_progress', revision: 3, agentSessionId: 'dead-child-session' }],
+    }),
+  });
+
+  const fiber = ctx.plugin(teamPlugin, {
+    strategy: 'hybrid',
+    stallTimeoutMs: 80,
+    watchdogSweepMs: 25,
+    maxAutoContinuations: 2,
+    maxRequestErrorRetries: 2,
+    maxStallRecoveries: 2,
+    retryBackoffMs: 5,
+  });
+  await fiber;
+
+  try {
+    // 1. max-tokens triggers agent.steer auto-continuation up to cap
+    ctx.emit('agent/status', { agent: fakeAgent, status: 'running' } as never);
+    ctx.emit('agent/assistant-stream', {
+      agent: fakeAgent,
+      frame: { type: 'chunk', chunk: { type: 'finish', reason: { kind: 'max-tokens' } } },
+    } as never);
+    await ctx.waterfall('agent/turn-stopping', { agent: fakeAgent, turn: 1, signal: new AbortController().signal } as never, async () => {});
+    await ctx.waterfall('agent/turn-stopping', { agent: fakeAgent, turn: 1, signal: new AbortController().signal } as never, async () => {});
+    await ctx.waterfall('agent/turn-stopping', { agent: fakeAgent, turn: 1, signal: new AbortController().signal } as never, async () => {});
+    assert.equal(steered.length, 2);
+
+    // 2. Retryable request-error returns { kind: 'retry' }; non-retryable AUTH delegates
+    const retry1 = await ctx.waterfall(
+      'agent/request-error',
+      {
+        agent: fakeAgent,
+        turn: 1,
+        step: 1,
+        provider: 'google-antigravity',
+        failure: { code: 'RATE_LIMIT', message: '429 rate limited', status: 429 },
+        retryPolicy: undefined,
+        signal: new AbortController().signal,
+      } as never,
+      async () => undefined,
+    );
+    assert.deepEqual(retry1, { kind: 'retry' });
+    const nonRetryAuth = await ctx.waterfall(
+      'agent/request-error',
+      {
+        agent: fakeAgent,
+        turn: 1,
+        step: 2,
+        provider: 'google-antigravity',
+        failure: { code: 'AUTH', message: 'invalid api key', status: 401 },
+        retryPolicy: undefined,
+        signal: new AbortController().signal,
+      } as never,
+      async () => undefined,
+    );
+    assert.equal(nonRetryAuth, undefined);
+
+    // 3. dispatch_worker cold-resumes once in same worktree when attempt 1 fails with stopReason='error'
+    const dispatchTool = ctx.tools.get('dispatch_worker')!;
+    const dRes = (await dispatchTool.execute(
+      { cardId: 'c1', task: 'Verify cold-resume', testCommand: 'node -e "process.exit(0)"', useWorktree: true },
+      { agent: fakeAgent, signal: AbortSignal.timeout(10_000) } as never,
+    )) as { ok: boolean; resumedFromCheckpoint: boolean; workerSummary: string; review: { snapshot: { passed: boolean } } };
+    assert.equal(subAttempts, 2);
+    assert.equal(dRes.resumedFromCheckpoint, true);
+    assert.equal(dRes.workerSummary, 'completed cleanly');
+    assert.equal(dRes.review.snapshot.passed, true);
+
+    // 4. Idle stall sweep cancels with keepInbox=true and triggers followup + reconciles orphaned board card
+    ctx.emit('agent/status', { agent: fakeAgent, status: 'running' } as never);
+    await new Promise((r) => setTimeout(r, 260));
+    assert.ok(cancels.length >= 1);
+    assert.ok(followups.length >= 1);
+    assert.ok(orphanMoves.some((m) => (m as { cardId?: string; toColumn?: string }).cardId === 'orphan-1' && (m as { toColumn?: string }).toColumn === 'ready'));
+    assert.ok(ctx.nsTeam!.watchdog.getStatus('sess-wd').totalEvents >= 4);
   } finally {
     await fiber.dispose();
     rmSync(repo, { recursive: true, force: true });

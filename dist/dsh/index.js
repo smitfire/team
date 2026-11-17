@@ -64,6 +64,8 @@ function sleepWithSignal(ms, signal, pendingSleeps) {
         timer.unref?.();
         pendingSleeps.add(finish);
         signal?.addEventListener('abort', finish, { once: true });
+        if (signal?.aborted)
+            finish();
     });
 }
 function renderJson(_args, value) {
@@ -303,9 +305,9 @@ export function apply(ctx, rawConfig = {}) {
             return;
         }
         const snap = watchdog.getSession(sid);
-        if (snap?.lastFinishReason === 'max-tokens') {
+        if (snap?.lastFinishReason === 'max-tokens' && typeof agent.steer === 'function') {
             const decision = watchdog.consumeAutoContinuation(sid, maxAutoContinuations, 'turn stopping after max-tokens');
-            if (decision.allowed && typeof agent.steer === 'function') {
+            if (decision.allowed) {
                 try {
                     await Promise.resolve(agent.steer(makeWatchdogUserMessage(`[Auto-Continue ${decision.count}/${maxAutoContinuations}]: Output reached max-tokens limit. Continue seamlessly from exact cutoff without repeating completed work.`)));
                 }
@@ -430,12 +432,13 @@ export function apply(ctx, rawConfig = {}) {
         watchdogCancelling.clear();
         globalHitlPending = 0;
     });
+    const LOOP_ABORT_MARKER = 'LOOP_WATCHDOG_ABORT';
     // Track tool outcomes via SwitchyardStageRouter & abort stalled worker subagents after repeated identical calls.
     ctx.on('tools/result', (exec, result) => {
         if (!exec.agent)
             return;
         const sid = String(exec.agent.session.id);
-        watchdog.touch(sid, Date.now(), result?.isError !== true);
+        watchdog.touch(sid);
         const argsStr = JSON.stringify(exec.arguments ?? {}).slice(0, 120);
         const preview = (Array.isArray(result?.content) ? result.content : [])
             .filter((b) => b?.type === 'text' && typeof b.text === 'string')
@@ -444,7 +447,7 @@ export function apply(ctx, rawConfig = {}) {
             .slice(0, 300);
         const workerCtrl = childRepeatCounts.get(sid);
         if (workerCtrl && watchdog.observeToolOutcome(sid, exec.name, argsStr, preview)) {
-            workerCtrl.abort(new Error(`worker stalled repeating ${exec.name} ${progressWatchLimit} times`));
+            workerCtrl.abort(new Error(`${LOOP_ABORT_MARKER}: worker stalled repeating ${exec.name} ${progressWatchLimit} times`));
         }
         if (strategy === 'subagent-team')
             return;
@@ -680,6 +683,9 @@ export function apply(ctx, rawConfig = {}) {
                     }
                     finally {
                         exec.signal.removeEventListener('abort', onParentAbort);
+                        if (!stallCtrl.signal.aborted) {
+                            stallCtrl.abort('attempt_finished');
+                        }
                         if (lastChildSid) {
                             childRepeatCounts.delete(lastChildSid);
                         }
@@ -693,8 +699,10 @@ export function apply(ctx, rawConfig = {}) {
                     if (workerError) {
                         attemptErrors.push(`attempt ${attempt}: ${workerError}`);
                     }
-                    const abortedByWatchdog = stallCtrl.signal.aborted && !exec.signal.aborted;
-                    if (!workerError || exec.signal.aborted || (!abortedByWatchdog && isDeterministicFailure(workerError))) {
+                    const reasonText = String(stallCtrl.signal.reason?.message ?? stallCtrl.signal.reason ?? '');
+                    const abortedByLoop = stallCtrl.signal.aborted && reasonText.includes(LOOP_ABORT_MARKER);
+                    const abortedByWatchdog = stallCtrl.signal.aborted && !abortedByLoop && !exec.signal.aborted;
+                    if (!workerError || exec.signal.aborted || abortedByLoop || (!abortedByWatchdog && isDeterministicFailure(workerError))) {
                         break;
                     }
                 }

@@ -1,6 +1,7 @@
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
 import { Context } from '@deepseek-ai/cordis';
 import z from '@deepseek-ai/schemastery';
 import { defineTool } from '@deepseek-ai/dsh-tools';
@@ -26,8 +27,26 @@ import {
   type SwitchyardStrategy,
 } from '../core/index.js';
 
-const WATCHDOG_FOLLOWUP_SETTLE_MS = 150;
-const MAX_DISPATCH_ATTEMPTS = 2;
+const execFileAsync = promisify(execFile);
+
+const TEAM_DEFAULTS = {
+  maxAdvisorCallsPerCard: 2,
+  deescalateAfterCleanSteps: 3,
+  stallTimeoutMs: 90_000,
+  watchdogSweepMs: 5_000,
+  maxAutoContinuations: 3,
+  maxRequestErrorRetries: 2,
+  maxStallRecoveries: 2,
+  retryBackoffMs: 600,
+  progressWatchLimit: DEFAULT_PROGRESS_WATCH_LIMIT,
+  watchdogFollowupSettleMs: 150,
+  maxDispatchAttempts: 2,
+} as const;
+
+function clampInt(raw: number | undefined, fallback: number, min: number, max: number): number {
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return fallback;
+  return Math.min(max, Math.max(min, Math.floor(raw)));
+}
 
 export const name = 'ns-team';
 export const inject = ['tools', 'agents', 'subagents', 'systemPrompt'] as const;
@@ -53,19 +72,19 @@ export const Config = z.object({
   strategy: z
     .union([z.const('switchyard-stage'), z.const('subagent-team'), z.const('hybrid')])
     .default('hybrid'),
-  maxAdvisorCallsPerCard: z.number().default(2),
+  maxAdvisorCallsPerCard: z.number().default(TEAM_DEFAULTS.maxAdvisorCallsPerCard),
   requireHumanReviewApproval: z.boolean().default(false),
   defaultTestCommand: z.string().default('npm test'),
-  deescalateAfterCleanSteps: z.number().default(3),
-  stallTimeoutMs: z.number().default(90_000),
-  watchdogSweepMs: z.number().default(5_000),
-  maxAutoContinuations: z.number().default(3),
-  maxRequestErrorRetries: z.number().default(2),
-  maxStallRecoveries: z.number().default(2),
-  retryBackoffMs: z.number().default(600),
-  progressWatchLimit: z.number().default(DEFAULT_PROGRESS_WATCH_LIMIT),
-  watchdogFollowupSettleMs: z.number().default(WATCHDOG_FOLLOWUP_SETTLE_MS),
-  maxDispatchAttempts: z.number().default(MAX_DISPATCH_ATTEMPTS),
+  deescalateAfterCleanSteps: z.number().default(TEAM_DEFAULTS.deescalateAfterCleanSteps),
+  stallTimeoutMs: z.number().default(TEAM_DEFAULTS.stallTimeoutMs),
+  watchdogSweepMs: z.number().default(TEAM_DEFAULTS.watchdogSweepMs),
+  maxAutoContinuations: z.number().default(TEAM_DEFAULTS.maxAutoContinuations),
+  maxRequestErrorRetries: z.number().default(TEAM_DEFAULTS.maxRequestErrorRetries),
+  maxStallRecoveries: z.number().default(TEAM_DEFAULTS.maxStallRecoveries),
+  retryBackoffMs: z.number().default(TEAM_DEFAULTS.retryBackoffMs),
+  progressWatchLimit: z.number().default(TEAM_DEFAULTS.progressWatchLimit),
+  watchdogFollowupSettleMs: z.number().default(TEAM_DEFAULTS.watchdogFollowupSettleMs),
+  maxDispatchAttempts: z.number().default(TEAM_DEFAULTS.maxDispatchAttempts),
 });
 
 export interface ReviewGateReport {
@@ -149,19 +168,19 @@ function workspaceRootOf(agent?: Agent): string {
 
 export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void {
   const strategy: SwitchyardStrategy = rawConfig.strategy ?? 'hybrid';
-  const maxAdvisorCallsPerCard = rawConfig.maxAdvisorCallsPerCard ?? 2;
+  const maxAdvisorCallsPerCard = clampInt(rawConfig.maxAdvisorCallsPerCard, TEAM_DEFAULTS.maxAdvisorCallsPerCard, 0, 20);
   const requireHumanReviewApproval = rawConfig.requireHumanReviewApproval ?? false;
   const defaultTestCommand = rawConfig.defaultTestCommand ?? 'npm test';
-  const deescalateAfterCleanSteps = rawConfig.deescalateAfterCleanSteps ?? 3;
-  const stallTimeoutMs = rawConfig.stallTimeoutMs ?? 90_000;
-  const watchdogSweepMs = rawConfig.watchdogSweepMs ?? 5_000;
-  const maxAutoContinuations = rawConfig.maxAutoContinuations ?? 3;
-  const maxRequestErrorRetries = rawConfig.maxRequestErrorRetries ?? 2;
-  const maxStallRecoveries = rawConfig.maxStallRecoveries ?? 2;
-  const retryBackoffMs = rawConfig.retryBackoffMs ?? 600;
-  const progressWatchLimit = rawConfig.progressWatchLimit ?? DEFAULT_PROGRESS_WATCH_LIMIT;
-  const watchdogFollowupSettleMs = rawConfig.watchdogFollowupSettleMs ?? WATCHDOG_FOLLOWUP_SETTLE_MS;
-  const maxDispatchAttempts = Math.max(1, rawConfig.maxDispatchAttempts ?? MAX_DISPATCH_ATTEMPTS);
+  const deescalateAfterCleanSteps = clampInt(rawConfig.deescalateAfterCleanSteps, TEAM_DEFAULTS.deescalateAfterCleanSteps, 1, 100);
+  const stallTimeoutMs = clampInt(rawConfig.stallTimeoutMs, TEAM_DEFAULTS.stallTimeoutMs, 10, 3_600_000);
+  const watchdogSweepMs = clampInt(rawConfig.watchdogSweepMs, TEAM_DEFAULTS.watchdogSweepMs, 0, 600_000);
+  const maxAutoContinuations = clampInt(rawConfig.maxAutoContinuations, TEAM_DEFAULTS.maxAutoContinuations, 0, 20);
+  const maxRequestErrorRetries = clampInt(rawConfig.maxRequestErrorRetries, TEAM_DEFAULTS.maxRequestErrorRetries, 0, 20);
+  const maxStallRecoveries = clampInt(rawConfig.maxStallRecoveries, TEAM_DEFAULTS.maxStallRecoveries, 0, 20);
+  const retryBackoffMs = clampInt(rawConfig.retryBackoffMs, TEAM_DEFAULTS.retryBackoffMs, 0, 60_000);
+  const progressWatchLimit = clampInt(rawConfig.progressWatchLimit, TEAM_DEFAULTS.progressWatchLimit, 2, 100);
+  const watchdogFollowupSettleMs = clampInt(rawConfig.watchdogFollowupSettleMs, TEAM_DEFAULTS.watchdogFollowupSettleMs, 10, 30_000);
+  const maxDispatchAttempts = clampInt(rawConfig.maxDispatchAttempts, TEAM_DEFAULTS.maxDispatchAttempts, 1, 10);
 
   const router = new SwitchyardStageRouter({
     strategy,
@@ -174,6 +193,7 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
   const activeDispatchCardIds = new Set<string>();
   const watchdogCancelling = new Set<string>();
   const pendingTimers = new Set<ReturnType<typeof setTimeout>>();
+  const pendingFollowupBySession = new Map<string, ReturnType<typeof setTimeout>>();
   let globalHitlPending = 0;
   let startupReconciled = false;
 
@@ -190,7 +210,7 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
       if (card.column !== 'in_progress') continue;
       if (activeDispatchCardIds.has(card.id)) continue;
       if (!card.agentSessionId || liveIds.has(card.agentSessionId)) continue;
-      if (card.updatedAt !== undefined && now - card.updatedAt < stallTimeoutMs) {
+      if (typeof card.updatedAt !== 'number' || now - card.updatedAt < stallTimeoutMs) {
         continue;
       }
       const moved = board.moveCard({
@@ -486,9 +506,19 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
         }
       }
 
+      const existingFollowup = pendingFollowupBySession.get(sid);
+      if (existingFollowup) {
+        clearTimeout(existingFollowup);
+        pendingTimers.delete(existingFollowup);
+        pendingFollowupBySession.delete(sid);
+      }
+
       const timer = setTimeout(() => {
         pendingTimers.delete(timer);
+        pendingFollowupBySession.delete(sid);
         watchdogCancelling.delete(sid);
+        const curSnap = watchdog.getStatus(sid).session;
+        if (!curSnap || curSnap.userCancelled) return;
         const stillLive = ctx.agents.get(sid as never) ?? ctx.agents.list().find((a) => String(a.session.id) === sid);
         if (!stillLive || typeof stillLive.followup !== 'function') return;
         try {
@@ -503,6 +533,7 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
       }, watchdogFollowupSettleMs);
       timer.unref?.();
       pendingTimers.add(timer);
+      pendingFollowupBySession.set(sid, timer);
     }
   };
 
@@ -512,6 +543,7 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
     if (sweepTimer) clearInterval(sweepTimer);
     for (const t of pendingTimers) clearTimeout(t);
     pendingTimers.clear();
+    pendingFollowupBySession.clear();
     watchdogCancelling.clear();
     globalHitlPending = 0;
   });
@@ -572,6 +604,13 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
     watchdog.clearSession(sid);
     pendingModelSwitch.delete(sid);
     childRepeatCounts.delete(sid);
+    watchdogCancelling.delete(sid);
+    const pendingFollowup = pendingFollowupBySession.get(sid);
+    if (pendingFollowup) {
+      clearTimeout(pendingFollowup);
+      pendingTimers.delete(pendingFollowup);
+      pendingFollowupBySession.delete(sid);
+    }
   });
 
   const schemaObj = { type: 'object' as const, properties: {}, additionalProperties: true };
@@ -646,6 +685,8 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
         let workerSummary = '';
         let workerError: string | undefined;
         let resumedFromCheckpoint = false;
+        const parentSid = String(exec.agent.session.id);
+        watchdog.beginToolCall(parentSid);
         activeDispatchCardIds.add(cardId);
         try {
           for (let attempt = 1; attempt <= maxDispatchAttempts; attempt += 1) {
@@ -657,13 +698,13 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
             let promptText = String(args.task);
             let capableOverride: AgentOptions | undefined;
             if (isResumeAttempt) {
-              resumedFromCheckpoint = true;
               let gitStatus = '';
               try {
-                gitStatus = execFileSync('git', ['-C', workerDir, 'status', '--short'], {
+                const { stdout } = await execFileAsync('git', ['-C', workerDir, 'status', '--short'], {
                   encoding: 'utf8',
-                  stdio: ['ignore', 'pipe', 'pipe'],
-                }).trim();
+                  timeout: 5_000,
+                });
+                gitStatus = stdout.trim();
                 if (gitStatus.length > 4000) {
                   gitStatus = `${gitStatus.slice(0, 4000)}\n...[truncated]`;
                 }
@@ -739,6 +780,8 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
 
               if (subResult.stopReason && subResult.stopReason !== 'completed') {
                 workerError = subResult.diagnostic || `subagent terminated with stopReason=${subResult.stopReason}`;
+              } else if (isResumeAttempt) {
+                resumedFromCheckpoint = true;
               }
             } catch (err) {
               workerError = err instanceof Error ? err.message : String(err);
@@ -809,6 +852,7 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
             review,
           } as never;
         } finally {
+          watchdog.endToolCall(parentSid);
           activeDispatchCardIds.delete(cardId);
           if (worktreeInfo) {
             removeIsolatedWorktree(repoRoot, worktreeInfo.worktreePath, worktreeInfo.branch);

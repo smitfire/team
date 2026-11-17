@@ -8,6 +8,7 @@ export declare class ProgressWatch {
     readonly limit: number;
     private previous;
     private repeats;
+    private tripped;
     constructor(limit?: number);
     observe(toolName: string, argsSummary: string, outputPreview?: string): boolean;
     getRepeatCount(): number;
@@ -48,6 +49,7 @@ export interface WatchdogStatusSnapshot {
 export declare function isUserAbortFailure(failure: unknown): boolean;
 /**
  * Shared predicate identifying deterministic (non-retryable) failures such as auth, permission, CUGA, or user aborts.
+ * Strictly mutually exclusive with {@link isRetryableUpstreamFailure}.
  */
 export declare function isDeterministicFailure(errOrFailure: unknown): boolean;
 /**

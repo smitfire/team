@@ -11,6 +11,7 @@ export class ProgressWatch {
   readonly limit: number;
   private previous: string | null = null;
   private repeats = 0;
+  private tripped = false;
 
   constructor(limit = DEFAULT_PROGRESS_WATCH_LIMIT) {
     if (!Number.isSafeInteger(limit) || limit < 2) {
@@ -21,15 +22,20 @@ export class ProgressWatch {
 
   observe(toolName: string, argsSummary: string, outputPreview = ''): boolean {
     const fingerprint = createHash('sha256')
-      .update(JSON.stringify([toolName, argsSummary, outputPreview]))
+      .update(JSON.stringify([toolName.slice(0, 128), argsSummary.slice(0, 256), outputPreview.slice(0, 512)]))
       .digest('hex');
     if (fingerprint === this.previous) {
       this.repeats += 1;
     } else {
       this.previous = fingerprint;
       this.repeats = 1;
+      this.tripped = false;
     }
-    return this.repeats >= this.limit;
+    if (this.repeats >= this.limit && !this.tripped) {
+      this.tripped = true;
+      return true;
+    }
+    return false;
   }
 
   getRepeatCount(): number {
@@ -39,6 +45,7 @@ export class ProgressWatch {
   reset(): void {
     this.previous = null;
     this.repeats = 0;
+    this.tripped = false;
   }
 }
 
@@ -147,10 +154,12 @@ export function isUserAbortFailure(failure: unknown): boolean {
 
 /**
  * Shared predicate identifying deterministic (non-retryable) failures such as auth, permission, CUGA, or user aborts.
+ * Strictly mutually exclusive with {@link isRetryableUpstreamFailure}.
  */
 export function isDeterministicFailure(errOrFailure: unknown): boolean {
   if (!errOrFailure) return false;
   if (isUserAbortFailure(errOrFailure)) return true;
+  if (isRetryableUpstreamFailure(errOrFailure)) return false;
   if (typeof errOrFailure === 'string') {
     return NON_RETRYABLE_MSG_RE.test(errOrFailure);
   }
@@ -159,7 +168,7 @@ export function isDeterministicFailure(errOrFailure: unknown): boolean {
   const code = typeof obj.code === 'string' ? obj.code.toUpperCase() : '';
   const status = typeof obj.status === 'number' ? obj.status : undefined;
   const message = typeof obj.message === 'string' ? obj.message : '';
-  if (NON_RETRYABLE_CODES.has(code) || code.startsWith('CUGA_') || status === 401 || status === 403 || status === 400) {
+  if (NON_RETRYABLE_CODES.has(code) || code.startsWith('CUGA_') || (status !== undefined && NON_RETRYABLE_STATUSES.has(status))) {
     return true;
   }
   return NON_RETRYABLE_MSG_RE.test(message);
@@ -280,6 +289,7 @@ export class StallWatchdog {
     if (running) {
       st.userCancelled = false;
       st.lastFinishReason = undefined;
+      st.autoContinuations = 0;
     }
   }
 
@@ -353,9 +363,6 @@ export class StallWatchdog {
         detail: `Repeated identical tool outcome (${toolName}) reached limit ${st.progressWatch.limit}`,
         timestamp: now,
       });
-    } else {
-      // Distinct forward tool progress resets stall recovery counter so long runs retain protection.
-      st.stallRecoveries = 0;
     }
     return triggered;
   }

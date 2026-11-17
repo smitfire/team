@@ -266,14 +266,15 @@ test('ProgressWatch, StallWatchdog exemptions, max-tokens steer, request-error r
     addComment: () => ({}),
     getCard: () => ({ id: 'c1', revision: 1, owner: 'worker' }),
     snapshot: () => ({
-      cards: [{ id: 'orphan-1', column: 'in_progress', revision: 3, agentSessionId: 'dead-child-session' }],
+      cards: [{ id: 'orphan-1', column: 'in_progress', revision: 3, agentSessionId: 'dead-child-session', updatedAt: 1 }],
     }),
   });
 
   const fiber = ctx.plugin(teamPlugin, {
     strategy: 'hybrid',
-    stallTimeoutMs: 80,
-    watchdogSweepMs: 25,
+    stallTimeoutMs: 60,
+    watchdogSweepMs: 20,
+    watchdogFollowupSettleMs: 40,
     maxAutoContinuations: 2,
     maxRequestErrorRetries: 2,
     maxStallRecoveries: 2,
@@ -336,7 +337,7 @@ test('ProgressWatch, StallWatchdog exemptions, max-tokens steer, request-error r
 
     // 4. Idle stall sweep cancels with keepInbox=true and triggers followup + reconciles orphaned board card
     ctx.emit('agent/status', { agent: fakeAgent, status: 'running' } as never);
-    await new Promise((r) => setTimeout(r, 260));
+    await new Promise((r) => setTimeout(r, 220));
     assert.ok(cancels.length >= 1);
     assert.ok(followups.length >= 1);
     assert.ok(orphanMoves.some((m) => (m as { cardId?: string; toColumn?: string }).cardId === 'orphan-1' && (m as { toColumn?: string }).toColumn === 'ready'));

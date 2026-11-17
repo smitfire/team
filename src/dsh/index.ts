@@ -557,11 +557,13 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
   });
 
   const LOOP_ABORT_MARKER = 'LOOP_WATCHDOG_ABORT';
+  const ATTEMPT_FINISHED_MARKER = 'ATTEMPT_FINISHED';
   // Track tool outcomes via SwitchyardStageRouter & abort stalled worker subagents after repeated identical calls.
   ctx.on('tools/result', (exec, result) => {
     if (!exec.agent) return;
     const sid = String(exec.agent.session.id);
-    watchdog.touch(sid);
+    // Keep maxStallRecoveries bounded across individual tool results; only clean 'stop' finishes reset it.
+    watchdog.touch(sid, Date.now(), false);
     const argsStr = JSON.stringify(exec.arguments ?? {}).slice(0, 120);
     const preview = (Array.isArray(result?.content) ? result.content : [])
       .filter((b): b is { type: 'text'; text: string } => b?.type === 'text' && typeof b.text === 'string')
@@ -766,6 +768,8 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
 
             let activation;
             let lastChildSid = '';
+            let abortedByLoop = false;
+            let abortedByWatchdog = false;
             try {
               activation = await ctx.subagents.startActivation({
                 provider: 'spawn',
@@ -815,8 +819,12 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
               }
             } finally {
               exec.signal.removeEventListener('abort', onParentAbort);
+              const reasonText = String((stallCtrl.signal.reason as { message?: unknown })?.message ?? stallCtrl.signal.reason ?? '');
+              abortedByLoop = stallCtrl.signal.aborted && reasonText.includes(LOOP_ABORT_MARKER);
+              abortedByWatchdog =
+                stallCtrl.signal.aborted && !abortedByLoop && !exec.signal.aborted && !reasonText.includes(ATTEMPT_FINISHED_MARKER);
               if (!stallCtrl.signal.aborted) {
-                stallCtrl.abort('attempt_finished');
+                stallCtrl.abort(ATTEMPT_FINISHED_MARKER);
               }
               if (lastChildSid) {
                 childRepeatCounts.delete(lastChildSid);
@@ -829,9 +837,6 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
             if (workerError) {
               attemptErrors.push(`attempt ${attempt}: ${workerError}`);
             }
-            const reasonText = String((stallCtrl.signal.reason as { message?: unknown })?.message ?? stallCtrl.signal.reason ?? '');
-            const abortedByLoop = stallCtrl.signal.aborted && reasonText.includes(LOOP_ABORT_MARKER);
-            const abortedByWatchdog = stallCtrl.signal.aborted && !abortedByLoop && !exec.signal.aborted;
             if (!workerError || exec.signal.aborted || abortedByLoop || (!abortedByWatchdog && isDeterministicFailure(workerError))) {
               break;
             }

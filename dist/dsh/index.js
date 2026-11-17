@@ -3,7 +3,7 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import z from '@deepseek-ai/schemastery';
 import { defineTool } from '@deepseek-ai/dsh-tools';
-import { createIsolatedWorktree, DEFAULT_PROGRESS_WATCH_LIMIT, generateSwitchyardRoutesToml, isRetryableUpstreamFailure, isUserAbortFailure, makeWatchdogUserMessage, removeIsolatedWorktree, runOcrDiffReview, selectCrossFamilyReviewer, StallWatchdog, SwitchyardStageRouter, verifySnapshotTests, } from '../core/index.js';
+import { createIsolatedWorktree, DEFAULT_PROGRESS_WATCH_LIMIT, generateSwitchyardRoutesToml, isDeterministicFailure, isRetryableUpstreamFailure, isUserAbortFailure, makeWatchdogUserMessage, removeIsolatedWorktree, runOcrDiffReview, selectCrossFamilyReviewer, StallWatchdog, SwitchyardStageRouter, verifySnapshotTests, } from '../core/index.js';
 const WATCHDOG_FOLLOWUP_SETTLE_MS = 150;
 const MAX_DISPATCH_ATTEMPTS = 2;
 export const name = 'ns-team';
@@ -22,6 +22,7 @@ export const Config = z.object({
     maxRequestErrorRetries: z.number().default(2),
     maxStallRecoveries: z.number().default(2),
     retryBackoffMs: z.number().default(600),
+    progressWatchLimit: z.number().default(DEFAULT_PROGRESS_WATCH_LIMIT),
 });
 function sleepWithSignal(ms, signal, pendingTimers) {
     if (ms <= 0 || signal?.aborted)
@@ -61,11 +62,13 @@ export function apply(ctx, rawConfig = {}) {
     const maxRequestErrorRetries = rawConfig.maxRequestErrorRetries ?? 2;
     const maxStallRecoveries = rawConfig.maxStallRecoveries ?? 2;
     const retryBackoffMs = rawConfig.retryBackoffMs ?? 600;
+    const progressWatchLimit = rawConfig.progressWatchLimit ?? DEFAULT_PROGRESS_WATCH_LIMIT;
+    const bootTimestamp = Date.now();
     const router = new SwitchyardStageRouter({
         strategy,
         deescalateAfterCleanSteps,
     });
-    const watchdog = new StallWatchdog();
+    const watchdog = new StallWatchdog({ progressWatchLimit });
     const advisorCallsByCard = new Map();
     const pendingModelSwitch = new Map();
     const childRepeatCounts = new Map();
@@ -80,6 +83,7 @@ export function apply(ctx, rawConfig = {}) {
         if (!board || !snap)
             return 0;
         const liveIds = new Set(ctx.agents.list().map((a) => String(a.session.id)));
+        const now = Date.now();
         let reconciled = 0;
         for (const card of snap.cards) {
             if (card.column !== 'in_progress')
@@ -88,6 +92,9 @@ export function apply(ctx, rawConfig = {}) {
                 continue;
             if (!card.agentSessionId || liveIds.has(card.agentSessionId))
                 continue;
+            if (card.updatedAt !== undefined && card.updatedAt > bootTimestamp && now - card.updatedAt < stallTimeoutMs) {
+                continue;
+            }
             const moved = board.moveCard({
                 cardId: card.id,
                 toColumn: 'ready',
@@ -110,6 +117,9 @@ export function apply(ctx, rawConfig = {}) {
                     kind: 'board_orphan_reconciled',
                     detail: `Reconciled orphaned in_progress card "${card.id}" -> ready`,
                 });
+            }
+            else {
+                log.warn(`Skipped orphan card "${card.id}" reconciliation: ${moved.reason ?? moved.status}`);
             }
         }
         return reconciled;
@@ -255,7 +265,7 @@ export function apply(ctx, rawConfig = {}) {
             }
         }));
     }
-    ctx.on('agent/turn-stopping', ({ agent, signal }) => {
+    ctx.on('agent/turn-stopping', async ({ agent, signal }) => {
         const sid = String(agent.session.id);
         if (signal?.aborted) {
             watchdog.markUserCancelled(sid, true);
@@ -265,7 +275,12 @@ export function apply(ctx, rawConfig = {}) {
         if (snap?.lastFinishReason === 'max-tokens') {
             const decision = watchdog.consumeAutoContinuation(sid, maxAutoContinuations, 'turn stopping after max-tokens');
             if (decision.allowed && typeof agent.steer === 'function') {
-                agent.steer(makeWatchdogUserMessage(`[Auto-Continue ${decision.count}/${maxAutoContinuations}]: Output reached max-tokens limit. Continue seamlessly from exact cutoff without repeating completed work.`));
+                try {
+                    await Promise.resolve(agent.steer(makeWatchdogUserMessage(`[Auto-Continue ${decision.count}/${maxAutoContinuations}]: Output reached max-tokens limit. Continue seamlessly from exact cutoff without repeating completed work.`)));
+                }
+                catch (err) {
+                    log.warn(`Auto-continue steer skipped for ${sid}: ${err instanceof Error ? err.message : String(err)}`);
+                }
             }
         }
     });
@@ -278,7 +293,10 @@ export function apply(ctx, rawConfig = {}) {
             const decision = watchdog.consumeRequestRetry(sid, maxRequestErrorRetries, `${payload.provider}:${fCode}${fMsg ? `:${fMsg}` : ''}`);
             if (decision.allowed) {
                 await sleepWithSignal(retryBackoffMs * Math.max(1, decision.count), payload.signal, pendingTimers);
-                if (!payload.signal?.aborted) {
+                if (payload.signal?.aborted) {
+                    watchdog.refundRequestRetry(sid);
+                }
+                else {
                     return { kind: 'retry' };
                 }
             }
@@ -359,39 +377,21 @@ export function apply(ctx, rawConfig = {}) {
             clearTimeout(t);
         pendingTimers.clear();
     });
-    // Track tool outcomes via SwitchyardStageRouter & abort stalled workers/loops on repeated identical calls.
+    // Track tool outcomes via SwitchyardStageRouter & abort stalled worker subagents after repeated identical calls.
     ctx.on('tools/result', (exec, result) => {
         if (!exec.agent)
             return;
         const sid = String(exec.agent.session.id);
-        watchdog.touch(sid);
+        watchdog.touch(sid, Date.now(), result?.isError !== true);
         const argsStr = JSON.stringify(exec.arguments ?? {}).slice(0, 120);
         const preview = (Array.isArray(result?.content) ? result.content : [])
             .filter((b) => b?.type === 'text' && typeof b.text === 'string')
             .map((b) => b.text)
             .join(' ')
             .slice(0, 300);
-        const watch = childRepeatCounts.get(sid);
-        if (watch) {
-            const sig = `${exec.name}:${argsStr}`;
-            if (sig === watch.lastSig) {
-                watch.repeats += 1;
-                if (watch.repeats >= DEFAULT_PROGRESS_WATCH_LIMIT) {
-                    watch.controller.abort(new Error(`worker stalled repeating ${exec.name} ${DEFAULT_PROGRESS_WATCH_LIMIT} times`));
-                }
-            }
-            else {
-                watch.lastSig = sig;
-                watch.repeats = 1;
-            }
-        }
-        if (watchdog.observeToolOutcome(sid, exec.name, argsStr, preview) && typeof exec.agent.cancel === 'function') {
-            try {
-                exec.agent.cancel({ kind: 'user' }, { keepInbox: false });
-            }
-            catch {
-                /* ignore cancel error */
-            }
+        const workerCtrl = childRepeatCounts.get(sid);
+        if (workerCtrl && watchdog.observeToolOutcome(sid, exec.name, argsStr, preview)) {
+            workerCtrl.abort(new Error(`worker stalled repeating ${exec.name} ${progressWatchLimit} times`));
         }
         if (strategy === 'subagent-team')
             return;
@@ -503,6 +503,7 @@ export function apply(ctx, rawConfig = {}) {
             try {
                 for (let attempt = 1; attempt <= MAX_DISPATCH_ATTEMPTS; attempt += 1) {
                     workerError = undefined;
+                    workerSummary = '';
                     const isResumeAttempt = attempt === MAX_DISPATCH_ATTEMPTS;
                     let promptText = String(args.task);
                     let capableOverride;
@@ -560,8 +561,18 @@ export function apply(ctx, rawConfig = {}) {
                             signal: combinedSignal,
                             delivery: 'caller',
                         });
-                        lastChildSid = String(activation.childId);
-                        childRepeatCounts.set(lastChildSid, { lastSig: '', repeats: 0, controller: stallCtrl });
+                        lastChildSid = activation.childId ? String(activation.childId) : '';
+                        if (lastChildSid) {
+                            childRepeatCounts.set(lastChildSid, stallCtrl);
+                            board?.moveCard({
+                                cardId,
+                                toColumn: 'in_progress',
+                                actor: 'orchestrator',
+                                role: 'orchestrator',
+                                agentSessionId: lastChildSid,
+                                reason: `Worker child session ${lastChildSid} active (attempt ${attempt}/${MAX_DISPATCH_ATTEMPTS})`,
+                            });
+                        }
                         const subResult = await activation.result;
                         workerSummary = subResult.output
                             .filter((b) => b.type === 'text')
@@ -569,7 +580,7 @@ export function apply(ctx, rawConfig = {}) {
                             .join('\n')
                             .slice(0, 4000);
                         const nsContext = ctx.get('nsContext');
-                        if (nsContext?.flushDeferredForSession) {
+                        if (lastChildSid && nsContext?.flushDeferredForSession) {
                             await nsContext.flushDeferredForSession(lastChildSid);
                         }
                         if (subResult.stopReason && subResult.stopReason !== 'completed') {
@@ -584,17 +595,17 @@ export function apply(ctx, rawConfig = {}) {
                         }
                     }
                     finally {
+                        if (lastChildSid) {
+                            childRepeatCounts.delete(lastChildSid);
+                        }
                         if (activation) {
-                            childRepeatCounts.delete(String(activation.childId));
                             try {
                                 await activation.dispose();
                             }
                             catch { /* ignore teardown error */ }
                         }
                     }
-                    const deterministicOrAborted = exec.signal.aborted ||
-                        (workerError !== undefined && /\b(?:USER_ABORT|ABORTED|AUTH|PERMISSION|CUGA_POLICY_DENY)\b/i.test(workerError));
-                    if (!workerError || deterministicOrAborted) {
+                    if (!workerError || exec.signal.aborted || isDeterministicFailure(workerError)) {
                         break;
                     }
                 }

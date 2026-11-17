@@ -1,8 +1,8 @@
 import type { Agent } from '@deepseek-ai/dsh-agent';
 export declare const DEFAULT_PROGRESS_WATCH_LIMIT = 4;
 /**
- * Loop-detection watchdog inspired by `dsh-workbench`'s ProgressWatch:
- * fingerprints consecutive `[toolName, argsSummary, outputPreview]` tuples.
+ * Loop-detection watchdog: fingerprints consecutive
+ * `[toolName, argsSummary, outputPreview]` tuples to halt repetitive calls.
  */
 export declare class ProgressWatch {
     readonly limit: number;
@@ -42,11 +42,14 @@ export interface WatchdogStatusSnapshot {
     readonly sessions: readonly WatchdogSessionSnapshot[];
     readonly session?: WatchdogSessionSnapshot;
 }
-export declare const USER_ABORT_CODES: Set<string>;
 /**
  * Shared predicate identifying user-initiated cancellation / abort failure codes.
  */
 export declare function isUserAbortFailure(failure: unknown): boolean;
+/**
+ * Shared predicate identifying deterministic (non-retryable) failures such as auth, permission, CUGA, or user aborts.
+ */
+export declare function isDeterministicFailure(errOrFailure: unknown): boolean;
 /**
  * Classify upstream LLM/transport failures for bounded automatic retry.
  * Explicit structured error codes and HTTP statuses take precedence over message text.
@@ -80,6 +83,7 @@ export declare class StallWatchdog {
     setPendingHitl(sessionId: string, delta: number, now?: number): void;
     markUserCancelled(sessionId: string, cancelled?: boolean, now?: number): void;
     recordFinishReason(sessionId: string, reason: string, now?: number): void;
+    refundRequestRetry(sessionId: string): void;
     observeToolOutcome(sessionId: string, toolName: string, argsSummary: string, outputPreview?: string, now?: number): boolean;
     private consumeBudget;
     consumeAutoContinuation(sessionId: string, maxAutoContinuations: number, detail?: string, now?: number): {

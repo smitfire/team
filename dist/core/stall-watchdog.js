@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 export const DEFAULT_PROGRESS_WATCH_LIMIT = 4;
 /**
- * Loop-detection watchdog inspired by `dsh-workbench`'s ProgressWatch:
- * fingerprints consecutive `[toolName, argsSummary, outputPreview]` tuples.
+ * Loop-detection watchdog: fingerprints consecutive
+ * `[toolName, argsSummary, outputPreview]` tuples to halt repetitive calls.
  */
 export class ProgressWatch {
     limit;
@@ -47,7 +47,7 @@ const RETRYABLE_CODES = new Set([
     'ENETUNREACH',
     'EAI_AGAIN',
 ]);
-export const USER_ABORT_CODES = new Set(['USER_ABORT', 'ABORT', 'ABORTED']);
+const USER_ABORT_CODES = new Set(['USER_ABORT', 'ABORT', 'ABORTED']);
 const NON_RETRYABLE_CODES = new Set([
     'AUTH',
     'PERMISSION',
@@ -59,17 +59,42 @@ const NON_RETRYABLE_CODES = new Set([
 ]);
 const RETRYABLE_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 const RETRYABLE_MSG_RE = /\b(?:rate[-_ ]?limit|too many requests|timed? ?out|etimedout|econnreset|fetch failed|overloaded|stream closed|temporarily unavailable|internal server error|bad gateway|gateway timeout|408|429|500|502|503|504)\b/i;
-const NON_RETRYABLE_MSG_RE = /\b(?:unauthorized|invalid api key|forbidden|cuga|user cancel(?:led|ed)?|aborted by user)\b/i;
+const NON_RETRYABLE_MSG_RE = /\b(?:unauthorized|invalid api key|forbidden|cuga|cuga_policy_deny|permission|validation|user cancel(?:led|ed)?|aborted by user|user_abort|aborted)\b/i;
 /**
  * Shared predicate identifying user-initiated cancellation / abort failure codes.
  */
 export function isUserAbortFailure(failure) {
+    if (typeof failure === 'string') {
+        return /\b(?:USER_ABORT|ABORT|ABORTED|user cancel(?:led|ed)?)\b/i.test(failure);
+    }
     if (!failure || typeof failure !== 'object')
         return false;
     const obj = failure;
     const name = typeof obj.name === 'string' ? obj.name : '';
     const code = typeof obj.code === 'string' ? obj.code.toUpperCase() : '';
     return name === 'AbortError' || USER_ABORT_CODES.has(code);
+}
+/**
+ * Shared predicate identifying deterministic (non-retryable) failures such as auth, permission, CUGA, or user aborts.
+ */
+export function isDeterministicFailure(errOrFailure) {
+    if (!errOrFailure)
+        return false;
+    if (isUserAbortFailure(errOrFailure))
+        return true;
+    if (typeof errOrFailure === 'string') {
+        return NON_RETRYABLE_MSG_RE.test(errOrFailure);
+    }
+    if (typeof errOrFailure !== 'object')
+        return false;
+    const obj = errOrFailure;
+    const code = typeof obj.code === 'string' ? obj.code.toUpperCase() : '';
+    const status = typeof obj.status === 'number' ? obj.status : undefined;
+    const message = typeof obj.message === 'string' ? obj.message : '';
+    if (NON_RETRYABLE_CODES.has(code) || code.startsWith('CUGA_') || status === 401 || status === 403 || status === 400) {
+        return true;
+    }
+    return NON_RETRYABLE_MSG_RE.test(message);
 }
 /**
  * Classify upstream LLM/transport failures for bounded automatic retry.
@@ -208,13 +233,22 @@ export class StallWatchdog {
         const st = this.ensure(sessionId, now);
         st.lastFinishReason = reason;
         st.lastActivityAt = now;
-        if (reason === 'stop' || reason === 'tool-calls') {
+        if (reason === 'stop') {
             st.autoContinuations = 0;
             st.requestErrorRetries = 0;
             st.stallRecoveries = 0;
-            if (reason === 'stop') {
-                st.progressWatch.reset();
-            }
+            st.progressWatch.reset();
+        }
+        else if (reason === 'tool-calls') {
+            // Tool execution is forward progress for network/stall retries, while preserving max-tokens cap across interleaved tool calls.
+            st.requestErrorRetries = 0;
+            st.stallRecoveries = 0;
+        }
+    }
+    refundRequestRetry(sessionId) {
+        const st = this.sessions.get(sessionId);
+        if (st && st.requestErrorRetries > 0) {
+            st.requestErrorRetries -= 1;
         }
     }
     observeToolOutcome(sessionId, toolName, argsSummary, outputPreview = '', now = Date.now()) {
@@ -239,12 +273,15 @@ export class StallWatchdog {
     consumeBudget(sessionId, field, maxAllowed, successKind, capLabel, detail, now) {
         const st = this.ensure(sessionId, now);
         const current = st[field];
-        if (st.userCancelled || current >= maxAllowed) {
+        if (st.userCancelled) {
+            return { allowed: false, count: current };
+        }
+        if (current >= maxAllowed) {
             this.recordEvent({
                 sessionId,
                 kind: 'loop_cap_reached',
                 attempt: current,
-                detail: `${capLabel} (${current}/${maxAllowed}): ${detail}`,
+                detail: `${capLabel} [${field}] (${current}/${maxAllowed}): ${detail}`,
                 timestamp: now,
             });
             return { allowed: false, count: current };

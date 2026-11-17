@@ -123,9 +123,10 @@ const NON_RETRYABLE_CODES = new Set([
 ]);
 
 const RETRYABLE_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+const NON_RETRYABLE_STATUSES = new Set([400, 401, 403, 404, 422]);
 
 const RETRYABLE_MSG_RE =
-  /\b(?:rate[-_ ]?limit|too many requests|timed? ?out|etimedout|econnreset|fetch failed|overloaded|stream closed|temporarily unavailable|internal server error|bad gateway|gateway timeout|408|429|500|502|503|504)\b/i;
+  /\b(?:rate[-_ ]?limit|too many requests|timed? ?out|etimedout|econnreset|fetch failed|overloaded|stream closed|temporarily unavailable|internal server error|bad gateway|gateway timeout)\b/i;
 
 const NON_RETRYABLE_MSG_RE =
   /\b(?:unauthorized|invalid api key|forbidden|cuga|cuga_policy_deny|permission|validation|user cancel(?:led|ed)?|aborted by user|user_abort|aborted)\b/i;
@@ -182,6 +183,7 @@ export function isRetryableUpstreamFailure(errOrFailure: unknown): boolean {
   const message = typeof obj.message === 'string' ? obj.message : '';
 
   if (name === 'AbortError' || NON_RETRYABLE_CODES.has(code) || code.startsWith('CUGA_')) return false;
+  if (status !== undefined && NON_RETRYABLE_STATUSES.has(status)) return false;
   if (RETRYABLE_CODES.has(code)) return true;
   if (status !== undefined && RETRYABLE_STATUSES.has(status)) return true;
   if (NON_RETRYABLE_MSG_RE.test(message)) return false;
@@ -216,8 +218,16 @@ export class StallWatchdog {
   private totalEvents = 0;
 
   constructor(opts: { maxEvents?: number; progressWatchLimit?: number } = {}) {
-    this.maxEvents = opts.maxEvents ?? 100;
-    this.progressWatchLimit = opts.progressWatchLimit ?? DEFAULT_PROGRESS_WATCH_LIMIT;
+    const maxEvents = opts.maxEvents ?? 100;
+    const progressWatchLimit = opts.progressWatchLimit ?? DEFAULT_PROGRESS_WATCH_LIMIT;
+    if (!Number.isSafeInteger(maxEvents) || maxEvents < 1) {
+      throw new Error(`maxEvents must be an integer >= 1 (got ${maxEvents})`);
+    }
+    if (!Number.isSafeInteger(progressWatchLimit) || progressWatchLimit < 2) {
+      throw new Error(`progressWatchLimit must be an integer >= 2 (got ${progressWatchLimit})`);
+    }
+    this.maxEvents = maxEvents;
+    this.progressWatchLimit = progressWatchLimit;
   }
 
   private ensure(sessionId: string, now = Date.now()): InternalSessionState {
@@ -287,11 +297,14 @@ export class StallWatchdog {
   }
 
   setPendingHitl(sessionId: string, delta: number, now = Date.now()): void {
+    if (delta === 0) return;
     if (delta < 0 && !this.sessions.has(sessionId)) return;
     const st = delta > 0 ? this.ensure(sessionId, now) : this.sessions.get(sessionId);
     if (!st) return;
     st.pendingHitlPrompts = Math.max(0, st.pendingHitlPrompts + delta);
-    st.lastActivityAt = now;
+    if (delta > 0) {
+      st.lastActivityAt = now;
+    }
   }
 
   markUserCancelled(sessionId: string, cancelled = true, now = Date.now()): void {
@@ -310,9 +323,8 @@ export class StallWatchdog {
       st.stallRecoveries = 0;
       st.progressWatch.reset();
     } else if (reason === 'tool-calls') {
-      // Tool execution is forward progress for network/stall retries, while preserving max-tokens cap across interleaved tool calls.
+      // Clear transient error count on tool-call continuation while preserving stall & max-tokens caps.
       st.requestErrorRetries = 0;
-      st.stallRecoveries = 0;
     }
   }
 

@@ -16,6 +16,8 @@ export interface PluginConfig {
     maxStallRecoveries?: number;
     retryBackoffMs?: number;
     progressWatchLimit?: number;
+    watchdogFollowupSettleMs?: number;
+    maxDispatchAttempts?: number;
 }
 export declare const Config: z<Schemastery.ObjectS<NoInfer<{
     strategy: z<"switchyard-stage" | "subagent-team" | "hybrid", "switchyard-stage" | "subagent-team" | "hybrid", "defined">;
@@ -30,6 +32,8 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
     maxStallRecoveries: z<number, number, "defined">;
     retryBackoffMs: z<number, number, "defined">;
     progressWatchLimit: z<number, number, "defined">;
+    watchdogFollowupSettleMs: z<number, number, "defined">;
+    maxDispatchAttempts: z<number, number, "defined">;
 }>>, Schemastery.ObjectT<NoInfer<{
     strategy: z<"switchyard-stage" | "subagent-team" | "hybrid", "switchyard-stage" | "subagent-team" | "hybrid", "defined">;
     maxAdvisorCallsPerCard: z<number, number, "defined">;
@@ -43,6 +47,8 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
     maxStallRecoveries: z<number, number, "defined">;
     retryBackoffMs: z<number, number, "defined">;
     progressWatchLimit: z<number, number, "defined">;
+    watchdogFollowupSettleMs: z<number, number, "defined">;
+    maxDispatchAttempts: z<number, number, "defined">;
 }>>, "plain">;
 export interface ReviewGateReport {
     cardId: string;

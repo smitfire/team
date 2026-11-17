@@ -45,6 +45,8 @@ export interface PluginConfig {
   maxStallRecoveries?: number;
   retryBackoffMs?: number;
   progressWatchLimit?: number;
+  watchdogFollowupSettleMs?: number;
+  maxDispatchAttempts?: number;
 }
 
 export const Config = z.object({
@@ -62,6 +64,8 @@ export const Config = z.object({
   maxStallRecoveries: z.number().default(2),
   retryBackoffMs: z.number().default(600),
   progressWatchLimit: z.number().default(DEFAULT_PROGRESS_WATCH_LIMIT),
+  watchdogFollowupSettleMs: z.number().default(WATCHDOG_FOLLOWUP_SETTLE_MS),
+  maxDispatchAttempts: z.number().default(MAX_DISPATCH_ATTEMPTS),
 });
 
 export interface ReviewGateReport {
@@ -156,7 +160,8 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
   const maxStallRecoveries = rawConfig.maxStallRecoveries ?? 2;
   const retryBackoffMs = rawConfig.retryBackoffMs ?? 600;
   const progressWatchLimit = rawConfig.progressWatchLimit ?? DEFAULT_PROGRESS_WATCH_LIMIT;
-  const bootTimestamp = Date.now();
+  const watchdogFollowupSettleMs = rawConfig.watchdogFollowupSettleMs ?? WATCHDOG_FOLLOWUP_SETTLE_MS;
+  const maxDispatchAttempts = Math.max(1, rawConfig.maxDispatchAttempts ?? MAX_DISPATCH_ATTEMPTS);
 
   const router = new SwitchyardStageRouter({
     strategy,
@@ -167,6 +172,7 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
   const pendingModelSwitch = new Map<string, { provider: string; model: string; reasoningEffort: 'low' | 'medium' | 'high' }>();
   const childRepeatCounts = new Map<string, AbortController>();
   const activeDispatchCardIds = new Set<string>();
+  const watchdogCancelling = new Set<string>();
   const pendingTimers = new Set<ReturnType<typeof setTimeout>>();
   let globalHitlPending = 0;
   let startupReconciled = false;
@@ -184,7 +190,7 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
       if (card.column !== 'in_progress') continue;
       if (activeDispatchCardIds.has(card.id)) continue;
       if (!card.agentSessionId || liveIds.has(card.agentSessionId)) continue;
-      if (card.updatedAt !== undefined && card.updatedAt > bootTimestamp && now - card.updatedAt < stallTimeoutMs) {
+      if (card.updatedAt !== undefined && now - card.updatedAt < stallTimeoutMs) {
         continue;
       }
       const moved = board.moveCard({
@@ -337,8 +343,13 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
     if (frame.type === 'chunk' && frame.chunk.type === 'finish') {
       const reason = frame.chunk.reason;
       watchdog.recordFinishReason(sid, reason.kind);
-      if (reason.kind === 'aborted' && isUserAbortFailure((reason as { failure?: unknown }).failure)) {
-        watchdog.markUserCancelled(sid, true);
+      if (reason.kind === 'aborted') {
+        if (watchdogCancelling.delete(sid)) {
+          return;
+        }
+        if (isUserAbortFailure((reason as { failure?: unknown }).failure)) {
+          watchdog.markUserCancelled(sid, true);
+        }
       }
     }
   });
@@ -432,7 +443,7 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
     }
   });
 
-  const hasPendingInteractivePrompt = (): boolean => {
+  const hasPendingInteractivePrompt = (_sessionId?: string): boolean => {
     if (globalHitlPending > 0) return true;
     const nsTui = ctx.get('nsTui') as
       | { pendingInteractions?: () => { approval?: unknown; question?: unknown } }
@@ -450,7 +461,7 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
         log.warn(`Orphan card reconciliation deferred due to error: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
-    const stalledIds = watchdog.checkStalledSessions(Date.now(), stallTimeoutMs, () => hasPendingInteractivePrompt());
+    const stalledIds = watchdog.checkStalledSessions(Date.now(), stallTimeoutMs, (sid) => hasPendingInteractivePrompt(sid));
     for (const sid of stalledIds) {
       const liveAgent = ctx.agents.get(sid as never) ?? ctx.agents.list().find((a) => String(a.session.id) === sid);
       if (!liveAgent) continue;
@@ -466,15 +477,18 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
       }
 
       if (typeof liveAgent.cancel === 'function') {
+        watchdogCancelling.add(sid);
         try {
           liveAgent.cancel({ kind: 'user' } as never, { keepInbox: true });
         } catch (err) {
+          watchdogCancelling.delete(sid);
           log.warn(`Watchdog cancel warning for ${sid}: ${err instanceof Error ? err.message : String(err)}`);
         }
       }
 
       const timer = setTimeout(() => {
         pendingTimers.delete(timer);
+        watchdogCancelling.delete(sid);
         const stillLive = ctx.agents.get(sid as never) ?? ctx.agents.list().find((a) => String(a.session.id) === sid);
         if (!stillLive || typeof stillLive.followup !== 'function') return;
         try {
@@ -486,7 +500,7 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
         } catch (err) {
           log.warn(`Watchdog followup skipped for ${sid}: ${err instanceof Error ? err.message : String(err)}`);
         }
-      }, WATCHDOG_FOLLOWUP_SETTLE_MS);
+      }, watchdogFollowupSettleMs);
       timer.unref?.();
       pendingTimers.add(timer);
     }
@@ -498,6 +512,8 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
     if (sweepTimer) clearInterval(sweepTimer);
     for (const t of pendingTimers) clearTimeout(t);
     pendingTimers.clear();
+    watchdogCancelling.clear();
+    globalHitlPending = 0;
   });
 
   // Track tool outcomes via SwitchyardStageRouter & abort stalled worker subagents after repeated identical calls.
@@ -617,8 +633,6 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
         const workerDir = worktreeInfo?.worktreePath ?? repoRoot;
         const baseSha = worktreeInfo?.headSha ?? 'HEAD~1';
         const authorProvider = exec.agent.options?.provider ?? router.resolveRoute('efficient').provider;
-        const stallCtrl = new AbortController();
-        const combinedSignal = AbortSignal.any([exec.signal, stallCtrl.signal]);
 
         board?.moveCard({
           cardId,
@@ -634,10 +648,12 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
         let resumedFromCheckpoint = false;
         activeDispatchCardIds.add(cardId);
         try {
-          for (let attempt = 1; attempt <= MAX_DISPATCH_ATTEMPTS; attempt += 1) {
+          for (let attempt = 1; attempt <= maxDispatchAttempts; attempt += 1) {
+            const stallCtrl = new AbortController();
+            const combinedSignal = AbortSignal.any([exec.signal, stallCtrl.signal]);
             workerError = undefined;
             workerSummary = '';
-            const isResumeAttempt = attempt === MAX_DISPATCH_ATTEMPTS;
+            const isResumeAttempt = attempt > 1;
             let promptText = String(args.task);
             let capableOverride: AgentOptions | undefined;
             if (isResumeAttempt) {
@@ -648,6 +664,9 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
                   encoding: 'utf8',
                   stdio: ['ignore', 'pipe', 'pipe'],
                 }).trim();
+                if (gitStatus.length > 4000) {
+                  gitStatus = `${gitStatus.slice(0, 4000)}\n...[truncated]`;
+                }
               } catch {
                 gitStatus = '';
               }
@@ -668,10 +687,10 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
                 author: 'ns-team-watchdog',
                 role: 'system',
                 kind: 'status',
-                body: `Cold-resuming stalled/failed worker (attempt ${attempt}/${MAX_DISPATCH_ATTEMPTS}) using ${capRoute.provider}/${capRoute.model}.`,
+                body: `Cold-resuming stalled/failed worker (attempt ${attempt}/${maxDispatchAttempts}) using ${capRoute.provider}/${capRoute.model}.`,
               });
               promptText = [
-                `[AUTO-RESUME CHECKPOINT — ATTEMPT ${attempt}/${MAX_DISPATCH_ATTEMPTS}]`,
+                `[AUTO-RESUME CHECKPOINT — ATTEMPT ${attempt}/${maxDispatchAttempts}]`,
                 'The previous worker attempt did not complete. Untrusted workspace status block follows; inspect files directly before editing.',
                 '<untrusted-git-status>',
                 gitStatus || '(clean working tree)',
@@ -703,7 +722,7 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
                   actor: 'orchestrator',
                   role: 'orchestrator',
                   agentSessionId: lastChildSid,
-                  reason: `Worker child session ${lastChildSid} active (attempt ${attempt}/${MAX_DISPATCH_ATTEMPTS})`,
+                  reason: `Worker child session ${lastChildSid} active (attempt ${attempt}/${maxDispatchAttempts})`,
                 });
               }
               const subResult = await activation.result;
@@ -736,7 +755,8 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
               }
             }
 
-            if (!workerError || exec.signal.aborted || isDeterministicFailure(workerError)) {
+            const abortedByWatchdog = stallCtrl.signal.aborted && !exec.signal.aborted;
+            if (!workerError || exec.signal.aborted || (!abortedByWatchdog && isDeterministicFailure(workerError))) {
               break;
             }
           }

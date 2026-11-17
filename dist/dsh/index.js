@@ -240,21 +240,21 @@ export function apply(ctx, rawConfig = {}) {
     });
     const log = ctx.logger(name);
     ctx.on('agent/status', ({ agent, status }) => {
-        watchdog.setRunning(String(agent.session.id), status === 'running');
+        const sid = String(agent.session.id);
+        if (status === 'idle') {
+            watchdogCancelling.delete(sid);
+        }
+        watchdog.setRunning(sid, status === 'running');
     });
     ctx.on('agent/assistant-stream', ({ agent, frame }) => {
         const sid = String(agent.session.id);
         watchdog.touch(sid);
         if (frame.type === 'chunk' && frame.chunk.type === 'finish') {
             const reason = frame.chunk.reason;
+            const wasWatchdogCancel = watchdogCancelling.delete(sid);
             watchdog.recordFinishReason(sid, reason.kind);
-            if (reason.kind === 'aborted') {
-                if (watchdogCancelling.delete(sid)) {
-                    return;
-                }
-                if (isUserAbortFailure(reason.failure)) {
-                    watchdog.markUserCancelled(sid, true);
-                }
+            if (reason.kind === 'aborted' && !wasWatchdogCancel && isUserAbortFailure(reason.failure)) {
+                watchdog.markUserCancelled(sid, true);
             }
         }
     });
@@ -299,7 +299,7 @@ export function apply(ctx, rawConfig = {}) {
             watchdog.markUserCancelled(sid, true);
             return;
         }
-        const snap = watchdog.getStatus(sid).session;
+        const snap = watchdog.getSession(sid);
         if (snap?.lastFinishReason === 'max-tokens') {
             const decision = watchdog.consumeAutoContinuation(sid, maxAutoContinuations, 'turn stopping after max-tokens');
             if (decision.allowed && typeof agent.steer === 'function') {
@@ -392,7 +392,7 @@ export function apply(ctx, rawConfig = {}) {
                 pendingTimers.delete(timer);
                 pendingFollowupBySession.delete(sid);
                 watchdogCancelling.delete(sid);
-                const curSnap = watchdog.getStatus(sid).session;
+                const curSnap = watchdog.getSession(sid);
                 if (!curSnap || curSnap.userCancelled)
                     return;
                 const stillLive = ctx.agents.get(sid) ?? ctx.agents.list().find((a) => String(a.session.id) === sid);
@@ -548,6 +548,8 @@ export function apply(ctx, rawConfig = {}) {
             });
             let workerSummary = '';
             let workerError;
+            let previousAttemptError;
+            let previousAttemptSummary = '';
             let resumedFromCheckpoint = false;
             const parentSid = String(exec.agent.session.id);
             watchdog.beginToolCall(parentSid);
@@ -556,9 +558,13 @@ export function apply(ctx, rawConfig = {}) {
                 for (let attempt = 1; attempt <= maxDispatchAttempts; attempt += 1) {
                     const stallCtrl = new AbortController();
                     const combinedSignal = AbortSignal.any([exec.signal, stallCtrl.signal]);
+                    const isResumeAttempt = attempt > 1;
+                    if (isResumeAttempt) {
+                        previousAttemptError = workerError;
+                        previousAttemptSummary = workerSummary;
+                    }
                     workerError = undefined;
                     workerSummary = '';
-                    const isResumeAttempt = attempt > 1;
                     let promptText = String(args.task);
                     let capableOverride;
                     if (isResumeAttempt) {
@@ -597,10 +603,14 @@ export function apply(ctx, rawConfig = {}) {
                         });
                         promptText = [
                             `[AUTO-RESUME CHECKPOINT — ATTEMPT ${attempt}/${maxDispatchAttempts}]`,
-                            'The previous worker attempt did not complete. Untrusted workspace status block follows; inspect files directly before editing.',
+                            `Previous attempt ended with: ${previousAttemptError ?? 'unknown error'}.`,
+                            'Untrusted workspace status and prior output follow; inspect files directly before editing.',
                             '<untrusted-git-status>',
                             gitStatus || '(clean working tree)',
                             '</untrusted-git-status>',
+                            ...(previousAttemptSummary
+                                ? ['<untrusted-prior-output>', previousAttemptSummary.slice(0, 800), '</untrusted-prior-output>']
+                                : []),
                             `Inspect the existing worktree state and complete the task:\n${String(args.task)}`,
                         ].join('\n');
                     }
@@ -681,14 +691,17 @@ export function apply(ctx, rawConfig = {}) {
                     return { ok: false, status: 'aborted', resumedFromCheckpoint };
                 }
                 if (workerError) {
+                    const combinedError = previousAttemptError
+                        ? `attempt 1: ${previousAttemptError}; attempt 2: ${workerError}${previousAttemptSummary ? ` | prior output: ${previousAttemptSummary.slice(0, 300)}` : ''}`
+                        : workerError;
                     board?.moveCard({
                         cardId,
                         toColumn: 'blocked',
                         actor: 'orchestrator',
                         role: 'system',
-                        reason: `Worker failed${resumedFromCheckpoint ? ' after cold-resume' : ''}: ${workerError}`,
+                        reason: `Worker failed: ${combinedError}`,
                     });
-                    return { ok: false, status: 'worker_failed', resumedFromCheckpoint, error: workerError };
+                    return { ok: false, status: 'worker_failed', resumedFromCheckpoint, error: combinedError };
                 }
                 if (worktreeInfo) {
                     try {

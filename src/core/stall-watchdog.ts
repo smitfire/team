@@ -20,9 +20,9 @@ export class ProgressWatch {
     this.limit = limit;
   }
 
-  observe(toolName: string, argsSummary: string, outputPreview = ''): boolean {
+  observe(toolName: string, argsSummary: string, _outputPreview = ''): boolean {
     const fingerprint = createHash('sha256')
-      .update(JSON.stringify([toolName.slice(0, 128), argsSummary.slice(0, 256), outputPreview.slice(0, 512)]))
+      .update(JSON.stringify([toolName.slice(0, 128), argsSummary.slice(0, 256)]))
       .digest('hex');
     if (fingerprint === this.previous) {
       this.repeats += 1;
@@ -136,14 +136,14 @@ const RETRYABLE_MSG_RE =
   /\b(?:rate[-_ ]?limit|too many requests|timed? ?out|etimedout|econnreset|fetch failed|overloaded|stream closed|temporarily unavailable|internal server error|bad gateway|gateway timeout)\b/i;
 
 const NON_RETRYABLE_MSG_RE =
-  /\b(?:unauthorized|invalid api key|forbidden|cuga|cuga_policy_deny|permission|validation|user cancel(?:led|ed)?|aborted by user|user_abort|aborted)\b/i;
+  /\b(?:unauthorized|invalid api key|forbidden|cuga|cuga_policy_deny|permission|validation|user cancel(?:led|ed)?|aborted by user|user_abort)\b/i;
 
 /**
  * Shared predicate identifying user-initiated cancellation / abort failure codes.
  */
 export function isUserAbortFailure(failure: unknown): boolean {
   if (typeof failure === 'string') {
-    return /\b(?:USER_ABORT|ABORT|ABORTED|user cancel(?:led|ed)?)\b/i.test(failure);
+    return /\b(?:USER_ABORT|USER_CANCEL(?:LED|ED)?|ABORTED BY USER)\b/i.test(failure);
   }
   if (!failure || typeof failure !== 'object') return false;
   const obj = failure as Record<string, unknown>;
@@ -493,6 +493,11 @@ export class StallWatchdog {
       this.events.shift();
     }
     return ev;
+  }
+
+  getSession(sessionId: string): WatchdogSessionSnapshot | undefined {
+    const st = this.sessions.get(sessionId);
+    return st ? this.toSnapshot(st) : undefined;
   }
 
   getStatus(sessionId?: string): WatchdogStatusSnapshot {

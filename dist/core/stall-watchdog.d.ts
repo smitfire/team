@@ -10,7 +10,7 @@ export declare class ProgressWatch {
     private repeats;
     private tripped;
     constructor(limit?: number);
-    observe(toolName: string, argsSummary: string, outputPreview?: string): boolean;
+    observe(toolName: string, argsSummary: string, _outputPreview?: string): boolean;
     getRepeatCount(): number;
     reset(): void;
 }
@@ -107,6 +107,7 @@ export declare class StallWatchdog {
     recordEvent(input: Omit<WatchdogEvent, 'id' | 'timestamp'> & {
         timestamp?: number;
     }): WatchdogEvent;
+    getSession(sessionId: string): WatchdogSessionSnapshot | undefined;
     getStatus(sessionId?: string): WatchdogStatusSnapshot;
     clearSession(sessionId: string): void;
 }

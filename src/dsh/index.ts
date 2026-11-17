@@ -518,9 +518,11 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
         pendingFollowupBySession.delete(sid);
         watchdogCancelling.delete(sid);
         const curSnap = watchdog.getSession(sid);
-        if (!curSnap || curSnap.userCancelled) return;
         const stillLive = ctx.agents.get(sid as never) ?? ctx.agents.list().find((a) => String(a.session.id) === sid);
-        if (!stillLive || typeof stillLive.followup !== 'function') return;
+        if (!curSnap || curSnap.userCancelled || !stillLive || typeof stillLive.followup !== 'function') {
+          watchdog.refundStallRecovery(sid);
+          return;
+        }
         try {
           stillLive.followup(
             makeWatchdogUserMessage(
@@ -528,6 +530,7 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
             ),
           );
         } catch (err) {
+          watchdog.refundStallRecovery(sid);
           log.warn(`Watchdog followup skipped for ${sid}: ${err instanceof Error ? err.message : String(err)}`);
         }
       }, watchdogFollowupSettleMs);
@@ -684,8 +687,8 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
 
         let workerSummary = '';
         let workerError: string | undefined;
-        let previousAttemptError: string | undefined;
-        let previousAttemptSummary = '';
+        const attemptErrors: string[] = [];
+        let lastPriorSummary = '';
         let resumedFromCheckpoint = false;
         const parentSid = String(exec.agent.session.id);
         watchdog.beginToolCall(parentSid);
@@ -693,11 +696,16 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
         try {
           for (let attempt = 1; attempt <= maxDispatchAttempts; attempt += 1) {
             const stallCtrl = new AbortController();
-            const combinedSignal = AbortSignal.any([exec.signal, stallCtrl.signal]);
+            const onParentAbort = () => stallCtrl.abort(exec.signal.reason);
+            if (exec.signal.aborted) {
+              stallCtrl.abort(exec.signal.reason);
+            } else {
+              exec.signal.addEventListener('abort', onParentAbort, { once: true });
+            }
             const isResumeAttempt = attempt > 1;
-            if (isResumeAttempt) {
-              previousAttemptError = workerError;
-              previousAttemptSummary = workerSummary;
+            const prevErr = attemptErrors.at(-1);
+            if (isResumeAttempt && workerSummary) {
+              lastPriorSummary = workerSummary;
             }
             workerError = undefined;
             workerSummary = '';
@@ -738,13 +746,13 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
               });
               promptText = [
                 `[AUTO-RESUME CHECKPOINT — ATTEMPT ${attempt}/${maxDispatchAttempts}]`,
-                `Previous attempt ended with: ${previousAttemptError ?? 'unknown error'}.`,
+                `Previous attempt ended with: ${prevErr ?? 'unknown error'}.`,
                 'Untrusted workspace status and prior output follow; inspect files directly before editing.',
                 '<untrusted-git-status>',
                 gitStatus || '(clean working tree)',
                 '</untrusted-git-status>',
-                ...(previousAttemptSummary
-                  ? ['<untrusted-prior-output>', previousAttemptSummary.slice(0, 800), '</untrusted-prior-output>']
+                ...(lastPriorSummary
+                  ? ['<untrusted-prior-output>', lastPriorSummary.slice(0, 800), '</untrusted-prior-output>']
                   : []),
                 `Inspect the existing worktree state and complete the task:\n${String(args.task)}`,
               ].join('\n');
@@ -761,7 +769,7 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
                 name: `w-${cardId.replace(/[^a-z0-9-]/gi, '').toLowerCase().slice(0, 17) || 'card'}-a${attempt}`,
                 prompt: [{ type: 'text', text: promptText }],
                 ...(capableOverride ? { agentOptions: capableOverride } : {}),
-                signal: combinedSignal,
+                signal: stallCtrl.signal,
                 delivery: 'caller',
               });
               lastChildSid = activation.childId ? String(activation.childId) : '';
@@ -788,7 +796,7 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
                 await nsContext.flushDeferredForSession(lastChildSid);
               }
 
-              if (subResult.stopReason && subResult.stopReason !== 'completed') {
+              if (subResult.stopReason !== undefined && subResult.stopReason !== 'completed') {
                 workerError = subResult.diagnostic || `subagent terminated with stopReason=${subResult.stopReason}`;
               } else if (isResumeAttempt) {
                 resumedFromCheckpoint = true;
@@ -800,6 +808,7 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
                 await nsContext.flushDeferredForSession(lastChildSid).catch(() => {});
               }
             } finally {
+              exec.signal.removeEventListener('abort', onParentAbort);
               if (lastChildSid) {
                 childRepeatCounts.delete(lastChildSid);
               }
@@ -808,6 +817,9 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
               }
             }
 
+            if (workerError) {
+              attemptErrors.push(`attempt ${attempt}: ${workerError}`);
+            }
             const abortedByWatchdog = stallCtrl.signal.aborted && !exec.signal.aborted;
             if (!workerError || exec.signal.aborted || (!abortedByWatchdog && isDeterministicFailure(workerError))) {
               break;
@@ -826,9 +838,7 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
           }
 
           if (workerError) {
-            const combinedError = previousAttemptError
-              ? `attempt 1: ${previousAttemptError}; attempt 2: ${workerError}${previousAttemptSummary ? ` | prior output: ${previousAttemptSummary.slice(0, 300)}` : ''}`
-              : workerError;
+            const combinedError = `${attemptErrors.join('; ')}${lastPriorSummary ? ` | prior output: ${lastPriorSummary.slice(0, 300)}` : ''}`;
             board?.moveCard({
               cardId,
               toColumn: 'blocked',

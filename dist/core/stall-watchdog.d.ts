@@ -10,7 +10,7 @@ export declare class ProgressWatch {
     private repeats;
     private tripped;
     constructor(limit?: number);
-    observe(toolName: string, argsSummary: string, _outputPreview?: string): boolean;
+    observe(toolName: string, argsSummary: string, outputPreview?: string): boolean;
     getRepeatCount(): number;
     reset(): void;
 }
@@ -86,6 +86,7 @@ export declare class StallWatchdog {
     markUserCancelled(sessionId: string, cancelled?: boolean, now?: number): void;
     recordFinishReason(sessionId: string, reason: string, now?: number): void;
     refundRequestRetry(sessionId: string): void;
+    refundStallRecovery(sessionId: string): void;
     observeToolOutcome(sessionId: string, toolName: string, argsSummary: string, outputPreview?: string, now?: number): boolean;
     private consumeBudget;
     consumeAutoContinuation(sessionId: string, maxAutoContinuations: number, detail?: string, now?: number): {

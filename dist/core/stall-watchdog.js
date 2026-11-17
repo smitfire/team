@@ -15,9 +15,9 @@ export class ProgressWatch {
         }
         this.limit = limit;
     }
-    observe(toolName, argsSummary, _outputPreview = '') {
+    observe(toolName, argsSummary, outputPreview = '') {
         const fingerprint = createHash('sha256')
-            .update(JSON.stringify([toolName.slice(0, 128), argsSummary.slice(0, 256)]))
+            .update(JSON.stringify([toolName.slice(0, 128), argsSummary.slice(0, 256), outputPreview.slice(0, 512)]))
             .digest('hex');
         if (fingerprint === this.previous) {
             this.repeats += 1;
@@ -235,7 +235,9 @@ export class StallWatchdog {
         if (!st)
             return;
         st.inFlightToolCalls = Math.max(0, st.inFlightToolCalls - 1);
-        st.lastActivityAt = now;
+        if (st.running) {
+            st.lastActivityAt = now;
+        }
     }
     setPendingHitl(sessionId, delta, now = Date.now()) {
         if (delta === 0)
@@ -274,6 +276,12 @@ export class StallWatchdog {
         const st = this.sessions.get(sessionId);
         if (st && st.requestErrorRetries > 0) {
             st.requestErrorRetries -= 1;
+        }
+    }
+    refundStallRecovery(sessionId) {
+        const st = this.sessions.get(sessionId);
+        if (st && st.stallRecoveries > 0) {
+            st.stallRecoveries -= 1;
         }
     }
     observeToolOutcome(sessionId, toolName, argsSummary, outputPreview = '', now = Date.now()) {

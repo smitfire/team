@@ -1,5 +1,7 @@
 - id: tool-agent-team
   disabled: true
+- id: plan-mode
+  disabled: true
 - insert:
     - id: ns-team
       name: '@smitfire/team'

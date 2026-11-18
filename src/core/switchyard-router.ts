@@ -97,7 +97,7 @@ export const DEFAULT_SWITCHYARD_CONFIG: SwitchyardConfig = {
 
 const TEST_FAIL_RE = /\b(?:FAIL|AssertionError|ERR_ASSERTION|ELIFECYCLE|exit code [1-9]|failures?:\s*[1-9])\b/i;
 const TEST_PASS_RE = /\b(?:PASS|all tests? passed|0 failures?|fail\s+0|[1-9]\d*\s+passed)\b/i;
-const PLAN_TOOLS_RE = /^(?:exit_plan_mode|enter_plan_mode|propose_work|board_propose|orchestrator_status|forewisp_upsert)$/i;
+const PLAN_TOOLS_RE = /^(?:handoff_plan|exit_plan_mode|enter_plan_mode|propose_work|board_propose|orchestrator_status|forewisp_upsert)$/i;
 const DELEGATE_TOOLS_RE = /^(?:dispatch_worker|ask_advisor|spawn|subagent|agent_team)$/i;
 const MUTATE_TOOLS_RE =
   /^(?:edit|edit_file|write|write_file|apply_patch|patch|multi_edit|str_replace|replace_in_file|create_file|fs_write|board_move|board_comment)$/i;

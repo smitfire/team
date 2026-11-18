@@ -359,7 +359,7 @@ test('NeMo Switchyard tool_semantics, churn escalation, verify-pass release, inf
   assert.equal(classifyToolSemantics('bash', '{"command":"node --test test/a.test.mjs 2>&1"}'), 'verify');
   assert.equal(classifyToolSemantics('bash', '{"command":"node -e \"[1].map(x => x)\""}'), 'observe');
   assert.equal(classifyToolSemantics('bash', '{"command":"rm -rf tmp"}'), 'mutate');
-  assert.equal(classifyToolSemantics('exit_plan_mode', '{}'), 'plan');
+  assert.equal(classifyToolSemantics('handoff_plan', '{}'), 'plan');
   assert.equal(classifyToolSemantics('dispatch_worker', '{}'), 'delegate');
 
   const router = new SwitchyardStageRouter({ deescalateAfterCleanSteps: 3, earlyReleaseOnVerifyPass: true, enableChurnEscalation: true });
@@ -483,6 +483,10 @@ test('Orchestrator default strategy enforces Plan->Kanban->Execute loop, 2-strik
   try {
     assert.equal(ctx.nsTeam!.strategy, 'orchestrator');
 
+    // 0. agent/created eagerly selects capable plannerRoute BEFORE Step 1 captures modelSelection
+    await ctx.serial('agent/created' as never, { agent: fakeRoot, source: 'startup' } as never);
+    assert.equal(selections.at(-1)?.reasoningEffort, 'high');
+
     // 1. Pre-step step 1 enters planning phase on capable plannerRoute & blocks mutating tools
     await ctx.waterfall(
       'agent/pre-step',
@@ -510,8 +514,8 @@ test('Orchestrator default strategy enforces Plan->Kanban->Execute loop, 2-strik
     assert.equal(cards.get('c-mech')?.modelTier, 'efficient');
     assert.equal(cards.get('c-hard')?.modelTier, 'capable');
 
-    // 3. exit_plan_mode logs plan on Kanban and flips to fast efficient executor
-    const exitTool = ctx.tools.get('exit_plan_mode')!;
+    // 3. handoff_plan logs plan on Kanban and flips to fast efficient executor
+    const exitTool = ctx.tools.get('handoff_plan')!;
     const handoff = (await exitTool.execute(
       { plan: 'Step 1: fix mechanical card\nStep 2: verify', executionTier: 'efficient' },
       { agent: fakeRoot, signal: AbortSignal.timeout(5000) } as never,

@@ -4,8 +4,59 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import z from '@deepseek-ai/schemastery';
 import { defineTool } from '@deepseek-ai/dsh-tools';
-import { createIsolatedWorktree, DEFAULT_PROGRESS_WATCH_LIMIT, generateSwitchyardRoutesToml, isDeterministicFailure, isRetryableUpstreamFailure, isUserAbortFailure, makeWatchdogUserMessage, removeIsolatedWorktree, runOcrDiffReview, selectCrossFamilyReviewer, StallWatchdog, SwitchyardStageRouter, verifySnapshotTests, } from '../core/index.js';
+import { classifyToolSemantics, createIsolatedWorktree, DEFAULT_PROGRESS_WATCH_LIMIT, generateSwitchyardRoutesToml, isDeterministicFailure, isQuotaOrRateLimitFailure, isRetryableUpstreamFailure, isUserAbortFailure, makeWatchdogUserMessage, removeIsolatedWorktree, runOcrDiffReview, selectCrossFamilyReviewer, StallWatchdog, SwitchyardStageRouter, verifySnapshotTests, } from '../core/index.js';
 const execFileAsync = promisify(execFile);
+const VALID_STRATEGIES = new Set(['orchestrator', 'switchyard-stage', 'subagent-team', 'hybrid']);
+function parseStrategy(raw) {
+    if (typeof raw !== 'string')
+        return undefined;
+    const trimmed = raw.trim();
+    return VALID_STRATEGIES.has(trimmed) ? trimmed : undefined;
+}
+const ORCH_MUTATING_TOOLS = new Set([
+    'edit',
+    'edit_file',
+    'write',
+    'write_file',
+    'apply_patch',
+    'patch',
+    'multi_edit',
+    'str_replace',
+    'replace_in_file',
+    'create_file',
+    'fs_write',
+    'remove',
+    'delete',
+    'rm',
+    'mkdir',
+    'dispatch_worker',
+]);
+const SHELL_MUTATING_RE = /(?:(?<![=0-9&])>>?(?![&>])|<<|\b(?:tee|rm|mv|cp|touch|mkdir|rmdir|chmod|chown|truncate|dd|git\s+(?:commit|checkout|reset|apply))\b|\bsed\s+-i|\b(?:node|python3?|perl|ruby)\b[^;|&]*(?:writeFile|appendFile|unlink|rename|rmdir|mkdir))/i;
+const PTC_MUTATING_RE = /\b(?:writeFile(?:Sync)?|appendFile(?:Sync)?|rm(?:Sync)?|unlink(?:Sync)?|rename(?:Sync)?|mkdir(?:Sync)?)\b/;
+function isMutatingCallDuringPlanning(toolName, rawArgs) {
+    const lower = toolName.trim().toLowerCase();
+    if (ORCH_MUTATING_TOOLS.has(lower))
+        return true;
+    const args = rawArgs && typeof rawArgs === 'object' ? rawArgs : {};
+    if (lower === 'bash' || lower === 'terminal' || lower === 'shell') {
+        const cmd = typeof args.command === 'string' ? args.command : typeof args.cmd === 'string' ? args.cmd : '';
+        return SHELL_MUTATING_RE.test(cmd);
+    }
+    if (lower === 'run_code' || lower === 'execute_code') {
+        const code = typeof args.code === 'string' ? args.code : '';
+        return PTC_MUTATING_RE.test(code);
+    }
+    return false;
+}
+function isRootAgentSession(agent, knownChildIds) {
+    if (!agent)
+        return false;
+    const sid = String(agent.session.id);
+    if (knownChildIds.has(sid))
+        return false;
+    const header = agent.session.header;
+    return !header?.parentSession;
+}
 const TEAM_DEFAULTS = {
     maxAdvisorCallsPerCard: 2,
     deescalateAfterCleanSteps: 3,
@@ -18,6 +69,8 @@ const TEAM_DEFAULTS = {
     progressWatchLimit: DEFAULT_PROGRESS_WATCH_LIMIT,
     watchdogFollowupSettleMs: 150,
     maxDispatchAttempts: 2,
+    cadenceSteps: 25,
+    twoStrikeThreshold: 2,
 };
 function clampInt(raw, fallback, min, max) {
     if (typeof raw !== 'number' || !Number.isFinite(raw))
@@ -28,8 +81,8 @@ export const name = 'ns-team';
 export const inject = ['tools', 'agents', 'subagents', 'systemPrompt'];
 export const Config = z.object({
     strategy: z
-        .union([z.const('switchyard-stage'), z.const('subagent-team'), z.const('hybrid')])
-        .default('hybrid'),
+        .union([z.const('orchestrator'), z.const('switchyard-stage'), z.const('subagent-team'), z.const('hybrid')])
+        .default('orchestrator'),
     maxAdvisorCallsPerCard: z.number().default(TEAM_DEFAULTS.maxAdvisorCallsPerCard),
     requireHumanReviewApproval: z.boolean().default(false),
     defaultTestCommand: z.string().default('npm test'),
@@ -43,6 +96,8 @@ export const Config = z.object({
     progressWatchLimit: z.number().default(TEAM_DEFAULTS.progressWatchLimit),
     watchdogFollowupSettleMs: z.number().default(TEAM_DEFAULTS.watchdogFollowupSettleMs),
     maxDispatchAttempts: z.number().default(TEAM_DEFAULTS.maxDispatchAttempts),
+    cadenceSteps: z.number().default(TEAM_DEFAULTS.cadenceSteps),
+    twoStrikeThreshold: z.number().default(TEAM_DEFAULTS.twoStrikeThreshold),
 });
 function sleepWithSignal(ms, signal, pendingSleeps) {
     if (ms <= 0 || signal?.aborted)
@@ -76,7 +131,7 @@ function workspaceRootOf(agent) {
     return typeof meta?.cwd === 'string' && meta.cwd.length > 0 ? meta.cwd : process.cwd();
 }
 export function apply(ctx, rawConfig = {}) {
-    const strategy = rawConfig.strategy ?? 'hybrid';
+    const strategy = parseStrategy(process.env.NS_TEAM_STRATEGY?.trim()) ?? parseStrategy(rawConfig.strategy) ?? 'orchestrator';
     const maxAdvisorCallsPerCard = clampInt(rawConfig.maxAdvisorCallsPerCard, TEAM_DEFAULTS.maxAdvisorCallsPerCard, 0, 20);
     const requireHumanReviewApproval = rawConfig.requireHumanReviewApproval ?? false;
     const defaultTestCommand = rawConfig.defaultTestCommand ?? 'npm test';
@@ -90,6 +145,9 @@ export function apply(ctx, rawConfig = {}) {
     const progressWatchLimit = clampInt(rawConfig.progressWatchLimit, TEAM_DEFAULTS.progressWatchLimit, 2, 100);
     const watchdogFollowupSettleMs = clampInt(rawConfig.watchdogFollowupSettleMs, TEAM_DEFAULTS.watchdogFollowupSettleMs, 10, 30_000);
     const maxDispatchAttempts = clampInt(rawConfig.maxDispatchAttempts, TEAM_DEFAULTS.maxDispatchAttempts, 1, 10);
+    const cadenceSteps = clampInt(rawConfig.cadenceSteps, TEAM_DEFAULTS.cadenceSteps, 2, 200);
+    const twoStrikeThreshold = clampInt(rawConfig.twoStrikeThreshold, TEAM_DEFAULTS.twoStrikeThreshold, 1, 10);
+    const log = ctx.logger(name);
     const router = new SwitchyardStageRouter({
         strategy,
         deescalateAfterCleanSteps,
@@ -97,6 +155,7 @@ export function apply(ctx, rawConfig = {}) {
     const watchdog = new StallWatchdog({ progressWatchLimit });
     const advisorCallsByCard = new Map();
     const pendingModelSwitch = new Map();
+    const orchestratorSessions = new Map();
     const childRepeatCounts = new Map();
     const activeDispatchCardIds = new Set();
     const watchdogCancelling = new Set();
@@ -106,6 +165,203 @@ export function apply(ctx, rawConfig = {}) {
     let globalHitlPending = 0;
     let startupReconciled = false;
     const getBoard = () => ctx.get('nsBoard');
+    const createDefaultOrchState = (sessionId) => ({
+        sessionId,
+        phase: 'planning',
+        stepsSincePlan: 0,
+        consecutiveFailures: 0,
+        planHandoffs: 0,
+        replans: 0,
+        cadenceReviews: 0,
+        createdInlineCardIds: [],
+    });
+    const ensureOrchState = (sessionId) => {
+        let st = orchestratorSessions.get(sessionId);
+        if (!st) {
+            st = createDefaultOrchState(sessionId);
+            orchestratorSessions.set(sessionId, st);
+        }
+        return st;
+    };
+    const peekOrchState = (sessionId) => {
+        const existing = orchestratorSessions.get(sessionId) ?? createDefaultOrchState(sessionId);
+        return { ...existing, createdInlineCardIds: [...existing.createdInlineCardIds] };
+    };
+    const enterPlanModeImpl = (input) => {
+        const st = ensureOrchState(input.sessionId);
+        const kind = input.kind ?? 'manual';
+        const nextRoute = router.resolvePlannerRoute(input.preferredProvider);
+        st.phase = 'planning';
+        st.stepsSincePlan = 0;
+        st.consecutiveFailures = 0;
+        st.lastReplanReason = input.reason;
+        st.pendingReplanNotice = kind === 'cadence' ? undefined : input.reason;
+        st.pendingCadenceNotice = kind === 'cadence' ? input.reason : undefined;
+        if (kind === 'cadence')
+            st.cadenceReviews += 1;
+        else
+            st.replans += 1;
+        pendingModelSwitch.set(input.sessionId, nextRoute);
+        const targetCardId = input.cardId ?? st.activeCardId;
+        if (targetCardId) {
+            st.activeCardId = targetCardId;
+            const board = getBoard();
+            board?.updateCardMeta?.(targetCardId, { phase: 'planning', modelTier: 'capable' });
+            const tag = kind === 'two_strike' ? '[2-STRIKE RE-PLAN]' : kind === 'cadence' ? '[CADENCE REVIEW]' : '[EXECUTOR HAND-BACK]';
+            try {
+                board?.addComment({
+                    cardId: targetCardId,
+                    author: 'ns-team-orchestrator',
+                    role: 'orchestrator',
+                    kind: 'status',
+                    body: `${tag} Returned to PLANNER (${nextRoute.provider}/${nextRoute.model} ${nextRoute.reasoningEffort}): ${input.reason}`,
+                });
+            }
+            catch { /* ignore if card absent */ }
+        }
+        if (kind === 'two_strike' || kind === 'manual') {
+            watchdog.recordEvent({
+                sessionId: input.sessionId,
+                kind: 'orchestrator_replan',
+                detail: `Entered PLAN phase (${kind}): ${input.reason}`,
+            });
+        }
+        else if (kind === 'cadence') {
+            watchdog.recordEvent({
+                sessionId: input.sessionId,
+                kind: 'orchestrator_cadence_review',
+                detail: `Cadence plan review triggered: ${input.reason}`,
+            });
+        }
+        return { ok: true, phase: st.phase, cardId: targetCardId, nextRoute, reason: input.reason };
+    };
+    const exitPlanModeImpl = (input) => {
+        const plan = input.plan.trim();
+        if (!plan)
+            throw new Error('exit_plan_mode requires a non-empty plan summary');
+        const st = ensureOrchState(input.sessionId);
+        const targetTier = input.executionTier === 'capable' ? 'capable' : 'efficient';
+        const nextRoute = router.resolveRoute(targetTier, input.preferredProvider);
+        const board = getBoard();
+        let cardsCreated = 0;
+        const cardsInput = Array.isArray(input.cards) ? input.cards : [];
+        const preparedCards = [];
+        if (board && cardsInput.length > 0) {
+            for (const item of cardsInput) {
+                const requestedId = typeof item.id === 'string' && item.id.trim() ? item.id.trim() : undefined;
+                const writeScopes = Array.isArray(item.writeScopes) ? item.writeScopes.map(String) : undefined;
+                const blockedBy = Array.isArray(item.blockedBy) ? item.blockedBy.map(String) : undefined;
+                const inferredTier = item.modelTier === 'capable' || item.modelTier === 'efficient'
+                    ? item.modelTier
+                    : router.inferCardTier({
+                        title: String(item.title ?? ''),
+                        description: typeof item.description === 'string' ? item.description : undefined,
+                        writeScopes,
+                        blockedBy,
+                    });
+                const existing = requestedId ? board.getCard(requestedId) : undefined;
+                if (existing) {
+                    board.updateCardMeta?.(existing.id, { phase: 'planning', modelTier: inferredTier });
+                    preparedCards.push({ id: existing.id, column: existing.column, modelTier: inferredTier });
+                    continue;
+                }
+                const proposed = board.proposeCard({
+                    id: requestedId,
+                    title: String(item.title ?? ''),
+                    description: typeof item.description === 'string' ? item.description : undefined,
+                    owner: typeof item.owner === 'string' ? item.owner : 'worker',
+                    agentSessionId: input.sessionId,
+                    modelTier: inferredTier,
+                    phase: 'planning',
+                    writeScopes,
+                    blockedBy,
+                });
+                cardsCreated += 1;
+                preparedCards.push(proposed.card);
+            }
+            const firstReady = preparedCards.find((c) => c.column === 'ready') ?? preparedCards[0];
+            if (firstReady) {
+                st.activeCardId = firstReady.id;
+                board.moveCard({
+                    cardId: firstReady.id,
+                    toColumn: 'in_progress',
+                    actor: 'orchestrator',
+                    role: 'orchestrator',
+                    phase: 'executing',
+                    modelTier: firstReady.modelTier ?? targetTier,
+                    agentSessionId: input.sessionId,
+                    reason: 'Orchestrator plan handoff -> executing card',
+                });
+            }
+        }
+        else if (board) {
+            const existingActive = st.activeCardId ? board.getCard(st.activeCardId) : undefined;
+            if (existingActive) {
+                board.updateCardMeta?.(existingActive.id, { phase: 'executing', modelTier: targetTier });
+                if (existingActive.column !== 'in_progress' && existingActive.column !== 'done') {
+                    board.moveCard({
+                        cardId: existingActive.id,
+                        toColumn: 'in_progress',
+                        actor: 'orchestrator',
+                        role: 'orchestrator',
+                        phase: 'executing',
+                        modelTier: targetTier,
+                        agentSessionId: input.sessionId,
+                        reason: 'Revised plan handoff -> resuming execution',
+                    });
+                }
+            }
+            else {
+                const inlineId = `orch-${input.sessionId.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 8) || 'root'}-${st.planHandoffs + 1}`;
+                const firstLine = plan.split(/\r?\n/)[0]?.trim() || 'Orchestrator task';
+                const proposed = board.proposeCard({
+                    id: inlineId,
+                    title: firstLine.slice(0, 140),
+                    description: plan.slice(0, 2000),
+                    owner: 'executor',
+                    agentSessionId: input.sessionId,
+                    modelTier: targetTier,
+                    phase: 'executing',
+                });
+                cardsCreated += 1;
+                st.activeCardId = proposed.card.id;
+                st.createdInlineCardIds.push(proposed.card.id);
+                board.moveCard({
+                    cardId: proposed.card.id,
+                    toColumn: 'in_progress',
+                    actor: 'orchestrator',
+                    role: 'orchestrator',
+                    phase: 'executing',
+                    modelTier: targetTier,
+                    agentSessionId: input.sessionId,
+                    reason: 'Orchestrator plan handoff -> executing inline plan',
+                });
+            }
+        }
+        st.phase = 'executing';
+        st.planSummary = plan.slice(0, 1200);
+        st.replanIf = input.replanIf?.trim();
+        st.stepsSincePlan = 0;
+        st.consecutiveFailures = 0;
+        st.planHandoffs += 1;
+        st.pendingReplanNotice = undefined;
+        st.pendingCadenceNotice = undefined;
+        router.stateFor(input.sessionId).activeTier = targetTier;
+        pendingModelSwitch.set(input.sessionId, nextRoute);
+        if (board && st.activeCardId) {
+            try {
+                board.addComment({
+                    cardId: st.activeCardId,
+                    author: 'ns-team-orchestrator',
+                    role: 'orchestrator',
+                    kind: 'plan',
+                    body: `[ORCHESTRATOR PLAN HANDOFF #${st.planHandoffs}] (executionTier=${targetTier}, route=${nextRoute.provider}/${nextRoute.model} ${nextRoute.reasoningEffort})\n${plan}${st.replanIf ? `\nRe-plan triggers: ${st.replanIf}` : ''}`,
+                });
+            }
+            catch { /* ignore if card absent */ }
+        }
+        return { ok: true, phase: st.phase, cardId: st.activeCardId, nextRoute, cardsCreated };
+    };
     const reconcileOrphanedCards = () => {
         const board = getBoard();
         const snap = board?.snapshot?.();
@@ -227,6 +483,10 @@ export function apply(ctx, rawConfig = {}) {
     ctx.provide('nsTeam', {
         router,
         watchdog,
+        strategy,
+        getOrchestratorState: (sessionId) => peekOrchState(sessionId),
+        exitPlanMode: exitPlanModeImpl,
+        enterPlanMode: enterPlanModeImpl,
         runReviewGate,
         exportRoutesToml: () => generateSwitchyardRoutesToml({ strategy, deescalateAfterCleanSteps }),
         reconcileOrphanedCards,
@@ -241,10 +501,48 @@ export function apply(ctx, rawConfig = {}) {
                 return '';
             const st = router.stateFor(sid);
             const route = router.resolveRoute(st.activeTier);
-            return `<switchyard-router strategy="${strategy}" tier="${st.activeTier}" target="${route.provider}/${route.model}" escalations="${st.escalations}" deescalations="${st.deescalations}" />`;
+            const orch = strategy === 'orchestrator' && isRootAgentSession(assembleCtx.agent, childRepeatCounts) ? ensureOrchState(sid) : undefined;
+            const lines = [
+                `<switchyard-router strategy="${strategy}" tier="${st.activeTier}" target="${route.provider}/${route.model}" escalations="${st.escalations}" deescalations="${st.deescalations}" score="${st.trajectoryScore}" />`,
+            ];
+            if (orch) {
+                const activeRoute = orch.phase === 'planning'
+                    ? router.resolvePlannerRoute(assembleCtx.agent?.options?.provider)
+                    : router.resolveRoute(st.activeTier, assembleCtx.agent?.options?.provider);
+                lines.push(`<orchestrator-protocol strategy="orchestrator" phase="${orch.phase}" route="${activeRoute.provider}/${activeRoute.model}:${activeRoute.reasoningEffort}" card="${orch.activeCardId ?? 'none'}" step="${orch.stepsSincePlan}/${cadenceSteps}" strikes="${orch.consecutiveFailures}/${twoStrikeThreshold}">`);
+                if (orch.phase === 'planning') {
+                    lines.push('PLANNING PHASE (capable planner, mutations blocked): Inspect files or run read-only checks. For read-only questions answer directly. Before writing/editing files or calling dispatch_worker, call exit_plan_mode({ plan, replanIf?, cards? }) to record your plan on Kanban and unlock fast execution mode.');
+                    if (orch.pendingReplanNotice) {
+                        lines.push(`RE-PLAN REQUIRED: ${orch.pendingReplanNotice}`);
+                    }
+                    if (orch.pendingCadenceNotice) {
+                        lines.push(`CADENCE REVIEW DUE: ${orch.pendingCadenceNotice}`);
+                    }
+                }
+                else {
+                    lines.push(`EXECUTING PHASE: Execute approved plan cleanly; propose/dispatch sub-cards with appropriate modelTier (efficient|capable), or call enter_plan_mode({ reason }) if assumptions fail.`);
+                }
+                lines.push('</orchestrator-protocol>');
+            }
+            return lines.join('\n');
         },
     });
-    const log = ctx.logger(name);
+    ctx.tools.guard((exec) => {
+        if (strategy !== 'orchestrator')
+            return undefined;
+        if (!isRootAgentSession(exec.agent, childRepeatCounts))
+            return undefined;
+        const sid = exec.agent ? String(exec.agent.session.id) : undefined;
+        if (!sid)
+            return undefined;
+        const ost = ensureOrchState(sid);
+        if (ost.phase === 'planning' && isMutatingCallDuringPlanning(exec.name, exec.arguments)) {
+            return {
+                reason: `Orchestrator PLANNING phase is read-only; blocked "${exec.name}". Call exit_plan_mode({ plan, cards? }) first to record the plan on Kanban and unlock execution.`,
+            };
+        }
+        return undefined;
+    });
     ctx.on('agent/status', ({ agent, status }) => {
         watchdog.setRunning(String(agent.session.id), status === 'running');
     });
@@ -315,6 +613,27 @@ export function apply(ctx, rawConfig = {}) {
                     log.warn(`Auto-continue steer skipped for ${sid}: ${err instanceof Error ? err.message : String(err)}`);
                 }
             }
+            return;
+        }
+        if (strategy === 'orchestrator' && isRootAgentSession(agent, childRepeatCounts)) {
+            const ost = orchestratorSessions.get(sid);
+            const board = getBoard();
+            if (ost && board) {
+                for (const cid of ost.createdInlineCardIds) {
+                    const card = board.getCard(cid);
+                    if (card && card.column === 'in_progress' && !activeDispatchCardIds.has(cid)) {
+                        board.moveCard({
+                            cardId: cid,
+                            toColumn: 'done',
+                            actor: 'orchestrator',
+                            role: 'orchestrator',
+                            phase: 'done',
+                            expectedRevision: card.revision,
+                            reason: 'Orchestrator turn completed cleanly',
+                        });
+                    }
+                }
+            }
         }
     });
     // Uses @deepseek-ai/dsh-agent RequestErrorAction waterfall contract ({ kind: 'retry' } vs delegating to next()).
@@ -323,6 +642,52 @@ export function apply(ctx, rawConfig = {}) {
         const fObj = payload.failure && typeof payload.failure === 'object' ? payload.failure : undefined;
         const fCode = typeof fObj?.code === 'string' ? fObj.code : 'unknown';
         const fMsg = typeof fObj?.message === 'string' ? fObj.message.slice(0, 120) : '';
+        if (!payload.signal?.aborted && isQuotaOrRateLimitFailure(payload.failure)) {
+            router.markProviderRateLimited(payload.provider, 120_000);
+            const inRootPlanning = strategy === 'orchestrator' &&
+                isRootAgentSession(payload.agent, childRepeatCounts) &&
+                orchestratorSessions.get(sid)?.phase === 'planning';
+            const curTier = inRootPlanning ? 'capable' : router.stateFor(sid).activeTier;
+            const altRoute = router.resolveAlternateProviderRoute(curTier, payload.provider);
+            if (altRoute.provider !== payload.provider) {
+                const decision = watchdog.consumeRequestRetry(sid, maxRequestErrorRetries, `quota_swap:${payload.provider}->${altRoute.provider}/${altRoute.model}`);
+                if (decision.allowed) {
+                    pendingModelSwitch.set(sid, altRoute);
+                    if (typeof payload.agent.model?.select === 'function') {
+                        try {
+                            payload.agent.model.select({
+                                provider: altRoute.provider,
+                                model: altRoute.model,
+                                reasoningEffort: altRoute.reasoningEffort,
+                            });
+                        }
+                        catch (err) {
+                            log.warn(`Quota failover model.select skipped for ${sid}: ${err instanceof Error ? err.message : String(err)}`);
+                        }
+                    }
+                    watchdog.recordEvent({
+                        sessionId: sid,
+                        kind: 'quota_model_swap',
+                        attempt: decision.count,
+                        detail: `Swapped ${payload.provider} -> ${altRoute.provider}/${altRoute.model} after ${fCode}`,
+                    });
+                    const activeCardId = orchestratorSessions.get(sid)?.activeCardId;
+                    if (activeCardId) {
+                        try {
+                            getBoard()?.addComment({
+                                cardId: activeCardId,
+                                author: 'ns-team-switchyard',
+                                role: 'system',
+                                kind: 'status',
+                                body: `[QUOTA FAILOVER] Provider ${payload.provider} hit ${fCode}; swapped mid-session to ${altRoute.provider}/${altRoute.model} (${altRoute.reasoningEffort}).`,
+                            });
+                        }
+                        catch { /* ignore if card absent */ }
+                    }
+                    return { kind: 'retry' };
+                }
+            }
+        }
         if (!payload.signal?.aborted && isRetryableUpstreamFailure(payload.failure)) {
             const decision = watchdog.consumeRequestRetry(sid, maxRequestErrorRetries, `${payload.provider}:${fCode}${fMsg ? `:${fMsg}` : ''}`);
             if (decision.allowed) {
@@ -461,13 +826,67 @@ export function apply(ctx, rawConfig = {}) {
             outputPreview: preview,
             preferredProvider: exec.agent.options?.provider,
         });
-        if (transition.changed) {
+        if (strategy === 'orchestrator' && isRootAgentSession(exec.agent, childRepeatCounts)) {
+            const ost = ensureOrchState(sid);
+            const semantics = classifyToolSemantics(exec.name, argsStr);
+            const testFailed = semantics === 'verify' &&
+                /\b(?:FAIL|AssertionError|ERR_ASSERTION|ELIFECYCLE|exit code [1-9]|failures?:\s*[1-9])\b/i.test(preview);
+            const isFailure = result?.isError === true || testFailed;
+            if (ost.phase === 'executing' && exec.name !== 'exit_plan_mode' && exec.name !== 'enter_plan_mode') {
+                if (isFailure) {
+                    ost.consecutiveFailures += 1;
+                    if (ost.consecutiveFailures >= twoStrikeThreshold) {
+                        enterPlanModeImpl({
+                            sessionId: sid,
+                            kind: 'two_strike',
+                            preferredProvider: exec.agent.options?.provider,
+                            reason: `2-strike failure hand-back after "${exec.name}" (${ost.consecutiveFailures} consecutive errors)`,
+                        });
+                        return;
+                    }
+                }
+                else {
+                    ost.consecutiveFailures = 0;
+                }
+            }
+        }
+        const inRootPlanning = strategy === 'orchestrator' &&
+            isRootAgentSession(exec.agent, childRepeatCounts) &&
+            ensureOrchState(sid).phase === 'planning';
+        if (transition.changed && !inRootPlanning) {
             pendingModelSwitch.set(sid, transition.route);
         }
     });
-    // Apply Switchyard model selection cleanly before next model step preparation.
+    // Apply Orchestrator turn initialization, cadence checks, and Switchyard model selection before each step.
     ctx.on('agent/pre-step', async (payload, next) => {
         const sid = String(payload.agent.session.id);
+        if (strategy === 'orchestrator' && isRootAgentSession(payload.agent, childRepeatCounts)) {
+            const ost = ensureOrchState(sid);
+            const isNewTurn = ost.lastTurnSeen !== undefined && payload.turn !== ost.lastTurnSeen;
+            if (isNewTurn) {
+                ost.phase = 'planning';
+                ost.stepsSincePlan = 0;
+                ost.consecutiveFailures = 0;
+                ost.pendingCadenceNotice = undefined;
+                ost.pendingReplanNotice = undefined;
+                pendingModelSwitch.set(sid, router.resolvePlannerRoute(payload.agent.options?.provider));
+            }
+            else if (ost.lastTurnSeen === undefined && ost.phase === 'planning' && !pendingModelSwitch.has(sid)) {
+                pendingModelSwitch.set(sid, router.resolvePlannerRoute(payload.agent.options?.provider));
+            }
+            ost.lastTurnSeen = payload.turn;
+            if (ost.phase === 'executing') {
+                ost.stepsSincePlan += 1;
+                if (ost.stepsSincePlan >= cadenceSteps) {
+                    enterPlanModeImpl({
+                        sessionId: sid,
+                        kind: 'cadence',
+                        preferredProvider: payload.agent.options?.provider,
+                        reason: `[plan review due] Reached ${ost.stepsSincePlan} execution steps since last plan handoff`,
+                    });
+                }
+            }
+        }
         const nextRoute = pendingModelSwitch.get(sid);
         if (nextRoute && typeof payload.agent.model?.select === 'function') {
             try {
@@ -489,6 +908,7 @@ export function apply(ctx, rawConfig = {}) {
         router.clearSession(sid);
         watchdog.clearSession(sid);
         pendingModelSwitch.delete(sid);
+        orchestratorSessions.delete(sid);
         childRepeatCounts.delete(sid);
         watchdogCancelling.delete(sid);
         const pendingFollowup = pendingFollowupBySession.get(sid);
@@ -500,10 +920,79 @@ export function apply(ctx, rawConfig = {}) {
     });
     const schemaObj = { type: 'object', properties: {}, additionalProperties: true };
     ctx.tools.register(defineTool({
-        name: 'propose_work',
-        description: 'Decompose work into Kanban cards with writeScopes and cycle-checked blockedBy DAG dependencies.',
+        name: 'exit_plan_mode',
+        description: 'Record the approved implementation plan and optional Kanban cards on @smitfire/board, unlock execution tools, and switch from capable planner to efficient executor.',
         parameters: {
-            cards: { type: 'json', required: true, description: 'Array of { id?, title, description?, writeScopes?, blockedBy?, owner? }.' },
+            plan: { type: 'string', required: true, description: 'Concise actionable execution plan.' },
+            replanIf: { type: 'string', description: 'Conditions that should trigger re-planning.' },
+            executionTier: { type: 'string', description: 'Optional initial execution tier: efficient|capable (default efficient).' },
+            cards: { type: 'json', description: 'Optional array of Kanban cards to propose with writeScopes, blockedBy, and modelTier.' },
+        },
+        output: { schema: schemaObj, render: renderJson },
+        execute: async (args, exec) => {
+            const sid = exec.agent ? String(exec.agent.session.id) : 'default';
+            const execTier = args.executionTier === 'capable' ? 'capable' : 'efficient';
+            const cards = Array.isArray(args.cards) ? args.cards : undefined;
+            return exitPlanModeImpl({
+                sessionId: sid,
+                plan: String(args.plan ?? ''),
+                replanIf: typeof args.replanIf === 'string' ? args.replanIf : undefined,
+                executionTier: execTier,
+                cards,
+                preferredProvider: exec.agent?.options?.provider,
+            });
+        },
+    }));
+    ctx.tools.register(defineTool({
+        name: 'enter_plan_mode',
+        description: 'Hand execution back to the capable Planner model and log the reason on the active Kanban card.',
+        parameters: {
+            reason: { type: 'string', required: true, description: 'Why execution requires re-planning.' },
+            cardId: { type: 'string', description: 'Optional Kanban card id to annotate.' },
+        },
+        output: { schema: schemaObj, render: renderJson },
+        execute: async (args, exec) => {
+            const sid = exec.agent ? String(exec.agent.session.id) : 'default';
+            return enterPlanModeImpl({
+                sessionId: sid,
+                reason: String(args.reason ?? 'Executor requested re-plan'),
+                cardId: typeof args.cardId === 'string' ? args.cardId : undefined,
+                preferredProvider: exec.agent?.options?.provider,
+                kind: 'manual',
+            });
+        },
+    }));
+    ctx.tools.register(defineTool({
+        name: 'orchestrator_status',
+        description: 'Inspect current Orchestrator phase (planning|executing), active Kanban card, step cadence, and Switchyard route.',
+        parameters: {},
+        output: { schema: schemaObj, render: renderJson },
+        isConcurrencySafe: () => true,
+        execute: async (_args, exec) => {
+            const sid = exec.agent ? String(exec.agent.session.id) : 'default';
+            const orch = peekOrchState(sid);
+            const sw = router.stateFor(sid);
+            return {
+                strategy,
+                ...orch,
+                cadenceSteps,
+                twoStrikeThreshold,
+                switchyardTier: sw.activeTier,
+                activeRoute: orch.phase === 'planning'
+                    ? router.resolvePlannerRoute(exec.agent?.options?.provider)
+                    : router.resolveRoute(sw.activeTier, exec.agent?.options?.provider),
+            };
+        },
+    }));
+    ctx.tools.register(defineTool({
+        name: 'propose_work',
+        description: 'Decompose work into Kanban cards with writeScopes, cycle-checked blockedBy DAG dependencies, and modelTier (efficient|capable).',
+        parameters: {
+            cards: {
+                type: 'json',
+                required: true,
+                description: 'Array of { id?, title, description?, writeScopes?, blockedBy?, owner?, modelTier? }.',
+            },
         },
         output: { schema: schemaObj, render: renderJson },
         execute: async (args, exec) => {
@@ -513,14 +1002,26 @@ export function apply(ctx, rawConfig = {}) {
             const list = Array.isArray(args.cards) ? args.cards : [];
             const created = [];
             for (const item of list) {
+                const writeScopes = Array.isArray(item.writeScopes) ? item.writeScopes.map(String) : undefined;
+                const blockedBy = Array.isArray(item.blockedBy) ? item.blockedBy.map(String) : undefined;
+                const modelTier = item.modelTier === 'capable' || item.modelTier === 'efficient'
+                    ? item.modelTier
+                    : router.inferCardTier({
+                        title: String(item.title ?? ''),
+                        description: typeof item.description === 'string' ? item.description : undefined,
+                        writeScopes,
+                        blockedBy,
+                    });
                 created.push(board.proposeCard({
                     id: typeof item.id === 'string' ? item.id : undefined,
                     title: String(item.title ?? ''),
                     description: typeof item.description === 'string' ? item.description : undefined,
                     owner: typeof item.owner === 'string' ? item.owner : 'worker',
                     agentSessionId: exec.agent ? String(exec.agent.session.id) : undefined,
-                    writeScopes: Array.isArray(item.writeScopes) ? item.writeScopes.map(String) : undefined,
-                    blockedBy: Array.isArray(item.blockedBy) ? item.blockedBy.map(String) : undefined,
+                    modelTier,
+                    phase: 'planning',
+                    writeScopes,
+                    blockedBy,
                 }));
             }
             return { proposed: created.length, cards: created };
@@ -528,12 +1029,13 @@ export function apply(ctx, rawConfig = {}) {
     }));
     ctx.tools.register(defineTool({
         name: 'dispatch_worker',
-        description: 'Run a worker on a card in an isolated git worktree, await context flush, and run mandatory Review gate (snapshot + OCR + cross-family).',
+        description: 'Run a worker on a card in an isolated git worktree using its assigned modelTier, await context flush, and run mandatory Review gate.',
         parameters: {
             cardId: { type: 'string', required: true, description: 'Target Kanban card id.' },
             task: { type: 'string', required: true, description: 'Focused execution prompt for the worker.' },
             testCommand: { type: 'string', description: 'Verification command for hermetic snapshot gate.' },
             useWorktree: { type: 'boolean', description: 'Use isolated git worktree (default true when inside git repo).' },
+            modelTier: { type: 'string', description: 'Optional override for worker modelTier: efficient|capable.' },
         },
         output: { schema: schemaObj, render: renderJson },
         execute: async (args, exec) => {
@@ -541,6 +1043,12 @@ export function apply(ctx, rawConfig = {}) {
                 throw new Error('dispatch_worker requires an active parent agent');
             const board = getBoard();
             const cardId = String(args.cardId);
+            const existingCard = board?.getCard(cardId);
+            const initialTier = args.modelTier === 'capable' || args.modelTier === 'efficient'
+                ? args.modelTier
+                : existingCard?.modelTier === 'capable' || existingCard?.modelTier === 'efficient'
+                    ? existingCard.modelTier
+                    : router.inferCardTier({ title: existingCard?.title ?? cardId, description: String(args.task) });
             const repoRoot = workspaceRootOf(exec.agent);
             const inGitRepo = existsSync(join(repoRoot, '.git'));
             const useWorktree = args.useWorktree !== false && inGitRepo;
@@ -550,20 +1058,23 @@ export function apply(ctx, rawConfig = {}) {
             }
             const workerDir = worktreeInfo?.worktreePath ?? repoRoot;
             const baseSha = worktreeInfo?.headSha ?? 'HEAD~1';
-            const authorProvider = exec.agent.options?.provider ?? router.resolveRoute('efficient').provider;
+            const authorProvider = exec.agent.options?.provider ?? router.resolveRoute(initialTier).provider;
             board?.moveCard({
                 cardId,
                 toColumn: 'in_progress',
                 actor: 'orchestrator',
                 role: 'orchestrator',
+                modelTier: initialTier,
+                phase: 'executing',
                 agentSessionId: String(exec.agent.session.id),
-                reason: `Dispatched worker in ${worktreeInfo ? worktreeInfo.branch : workerDir}`,
+                reason: `Dispatched worker (tier=${initialTier}) in ${worktreeInfo ? worktreeInfo.branch : workerDir}`,
             });
             let workerSummary = '';
             let workerError;
             const attemptErrors = [];
             let lastPriorSummary = '';
             let resumedFromCheckpoint = false;
+            let lastRouteUsed = router.resolveRoute(initialTier, authorProvider);
             const parentSid = String(exec.agent.session.id);
             watchdog.beginToolCall(parentSid);
             activeDispatchCardIds.add(cardId);
@@ -585,7 +1096,14 @@ export function apply(ctx, rawConfig = {}) {
                     workerError = undefined;
                     workerSummary = '';
                     let promptText = String(args.task);
-                    let capableOverride;
+                    const attemptTier = isResumeAttempt ? 'capable' : initialTier;
+                    const selectedRoute = router.resolveRoute(attemptTier, authorProvider);
+                    lastRouteUsed = selectedRoute;
+                    const routeOverride = {
+                        provider: selectedRoute.provider,
+                        model: selectedRoute.model,
+                        reasoningEffort: selectedRoute.reasoningEffort,
+                    };
                     if (isResumeAttempt) {
                         let gitStatus = '';
                         try {
@@ -601,12 +1119,7 @@ export function apply(ctx, rawConfig = {}) {
                         catch {
                             gitStatus = '';
                         }
-                        const capRoute = router.resolveRoute('capable', authorProvider);
-                        capableOverride = {
-                            provider: capRoute.provider,
-                            model: capRoute.model,
-                            reasoningEffort: capRoute.reasoningEffort,
-                        };
+                        board?.updateCardMeta?.(cardId, { modelTier: 'capable', phase: 'executing' });
                         watchdog.recordEvent({
                             sessionId: String(exec.agent.session.id),
                             kind: 'subagent_cold_resume',
@@ -618,7 +1131,7 @@ export function apply(ctx, rawConfig = {}) {
                             author: 'ns-team-watchdog',
                             role: 'system',
                             kind: 'status',
-                            body: `Cold-resuming stalled/failed worker (attempt ${attempt}/${maxDispatchAttempts}) using ${capRoute.provider}/${capRoute.model}.`,
+                            body: `Cold-resuming stalled/failed worker (attempt ${attempt}/${maxDispatchAttempts}) using ${selectedRoute.provider}/${selectedRoute.model}.`,
                         });
                         promptText = [
                             `[AUTO-RESUME CHECKPOINT — ATTEMPT ${attempt}/${maxDispatchAttempts}]`,
@@ -645,7 +1158,7 @@ export function apply(ctx, rawConfig = {}) {
                             label: `worker:${cardId}${isResumeAttempt ? ':resume' : ''}`,
                             name: `w-${cardId.replace(/[^a-z0-9-]/gi, '').toLowerCase().slice(0, 17) || 'card'}-a${attempt}`,
                             prompt: [{ type: 'text', text: promptText }],
-                            ...(capableOverride ? { agentOptions: capableOverride } : {}),
+                            agentOptions: routeOverride,
                             signal: stallCtrl.signal,
                             delivery: 'caller',
                         });
@@ -747,11 +1260,13 @@ export function apply(ctx, rawConfig = {}) {
                     repoDir: workerDir,
                     baseRef: baseSha,
                     testCommand: typeof args.testCommand === 'string' && args.testCommand.trim() ? args.testCommand : defaultTestCommand,
-                    authorProvider,
+                    authorProvider: lastRouteUsed.provider,
                     authorSessionId: String(exec.agent.session.id),
                 });
                 return {
                     ok: review.passed,
+                    modelTier: initialTier,
+                    routeUsed: lastRouteUsed,
                     resumedFromCheckpoint,
                     workerSummary,
                     review,

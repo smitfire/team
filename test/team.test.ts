@@ -8,8 +8,11 @@ import { Context } from '@deepseek-ai/cordis';
 import ToolsService from '@deepseek-ai/dsh-tools';
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt';
 import {
+  classifyToolSemantics,
   createIsolatedWorktree,
+  DEFAULT_SWITCHYARD_CONFIG,
   generateSwitchyardRoutesToml,
+  isQuotaOrRateLimitFailure,
   isRetryableUpstreamFailure,
   parseOcrJsonReport,
   ProgressWatch,
@@ -342,6 +345,243 @@ test('ProgressWatch, StallWatchdog exemptions, max-tokens steer, request-error r
     assert.ok(followups.length >= 1);
     assert.ok(orphanMoves.some((m) => (m as { cardId?: string; toColumn?: string }).cardId === 'orphan-1' && (m as { toColumn?: string }).toColumn === 'ready'));
     assert.ok(ctx.nsTeam!.watchdog.getStatus('sess-wd').totalEvents >= 4);
+  } finally {
+    await fiber.dispose();
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('NeMo Switchyard tool_semantics, churn escalation, verify-pass release, inferCardTier, and TOML', () => {
+  assert.equal(DEFAULT_SWITCHYARD_CONFIG.strategy, 'orchestrator');
+  assert.equal(classifyToolSemantics('read_file', '{"path":"a.ts"}'), 'observe');
+  assert.equal(classifyToolSemantics('edit_file', '{"path":"a.ts"}'), 'mutate');
+  assert.equal(classifyToolSemantics('bash', '{"command":"node --test test/a.test.mjs"}'), 'verify');
+  assert.equal(classifyToolSemantics('bash', '{"command":"node --test test/a.test.mjs 2>&1"}'), 'verify');
+  assert.equal(classifyToolSemantics('bash', '{"command":"node -e \"[1].map(x => x)\""}'), 'observe');
+  assert.equal(classifyToolSemantics('bash', '{"command":"rm -rf tmp"}'), 'mutate');
+  assert.equal(classifyToolSemantics('exit_plan_mode', '{}'), 'plan');
+  assert.equal(classifyToolSemantics('dispatch_worker', '{}'), 'delegate');
+
+  const router = new SwitchyardStageRouter({ deescalateAfterCleanSteps: 3, earlyReleaseOnVerifyPass: true, enableChurnEscalation: true });
+
+  // Exploration churn (5 observe calls without mutate/plan/verify) escalates to capable
+  for (let i = 0; i < 4; i += 1) {
+    assert.equal(router.recordToolOutcome({ sessionId: 'churn', toolName: 'read', argsSummary: `f${i}.ts`, isError: false }).changed, false);
+  }
+  const churnEsc = router.recordToolOutcome({ sessionId: 'churn', toolName: 'grep', argsSummary: 'pattern', isError: false });
+  assert.equal(churnEsc.changed, true);
+  assert.equal(churnEsc.tier, 'capable');
+  assert.match(churnEsc.reason ?? '', /observe_churn:5/);
+
+  // Explicit passing verify command releases capable hold early
+  const earlyRel = router.recordToolOutcome({
+    sessionId: 'churn',
+    toolName: 'bash',
+    argsSummary: 'node --test',
+    isError: false,
+    outputPreview: 'PASS 4 passed, 0 failures',
+  });
+  assert.equal(earlyRel.changed, true);
+  assert.equal(earlyRel.tier, 'efficient');
+  assert.equal(earlyRel.reason, 'verify_pass_early_release');
+
+  // Card tier inference + cross-provider alternate route
+  assert.equal(router.inferCardTier({ title: 'Rename foo to bar', writeScopes: ['src/a.ts'] }), 'efficient');
+  assert.equal(router.inferCardTier({ title: 'Fix concurrency race in auth cache', writeScopes: ['src/auth.ts'] }), 'capable');
+  assert.equal(router.inferCardTier({ title: 'Wire module', blockedBy: ['c1'] }), 'capable');
+
+  assert.equal(isQuotaOrRateLimitFailure({ code: 'QUOTA_EXCEEDED', status: 429 }), true);
+  assert.equal(isQuotaOrRateLimitFailure('account quota exceeded'), true);
+  assert.equal(isQuotaOrRateLimitFailure({ code: 'AUTH', status: 401 }), false);
+
+  const toml = generateSwitchyardRoutesToml();
+  assert.match(toml, /\[routes\.switchyard\.stage\.tool_semantics\]/);
+  assert.match(toml, /\[composite\.advisor_gate\]/);
+  assert.match(toml, /\[composite\.subagents\]/);
+  assert.match(toml, /\[targets\.planner\]/);
+});
+
+test('Orchestrator default strategy enforces Plan->Kanban->Execute loop, 2-strike replan, cadence, per-card tiering, and quota failover', async () => {
+  const repo = mkdtempSync(join(tmpdir(), 'ns-orch-unit-'));
+  writeFileSync(join(repo, 'package.json'), '{"private":true}');
+  const ctx = new Context();
+  await ctx.plugin(SystemPrompt);
+  await ctx.plugin(ToolsService);
+
+  const selections: Array<{ provider?: string; model?: string; reasoningEffort?: string }> = [];
+  let curModel = { provider: 'google-antigravity', model: 'antigravity-gemini-3.8-flash', reasoningEffort: 'low' };
+  const fakeRoot = {
+    id: 'orch-root',
+    session: { id: 'orch-root', header: {}, meta: { cwd: repo } },
+    options: { provider: 'google-antigravity', model: 'antigravity-gemini-3.8-flash' },
+    model: {
+      current: () => curModel,
+      select: (sel: { provider: string; model: string; reasoningEffort?: string }) => {
+        curModel = { provider: sel.provider, model: sel.model, reasoningEffort: sel.reasoningEffort ?? 'low' };
+        selections.push(sel);
+      },
+    },
+  } as never;
+  const childWorker = {
+    id: 'child-exec-1',
+    session: { id: 'child-exec-1', header: { parentSession: 'orch-root' }, meta: { cwd: repo } },
+  } as never;
+
+  const cards = new Map<string, Record<string, unknown>>();
+  const comments: Array<{ cardId: string; kind: string; body: string }> = [];
+  ctx.provide('nsBoard', {
+    proposeCard: (req: Record<string, unknown>) => {
+      const id = String(req.id || `c_${cards.size + 1}`);
+      const card = { id, revision: 1, column: 'ready', ...req };
+      cards.set(id, card);
+      return { card, scopeConflicts: [] };
+    },
+    moveCard: (req: Record<string, unknown>) => {
+      const c = cards.get(String(req.cardId)) ?? { id: String(req.cardId), revision: 0 };
+      const updated = {
+        ...c,
+        column: req.toColumn,
+        revision: Number(c.revision ?? 0) + 1,
+        ...(req.modelTier ? { modelTier: req.modelTier } : {}),
+        ...(req.phase ? { phase: req.phase } : {}),
+      };
+      cards.set(String(req.cardId), updated);
+      return { ok: true, status: 'moved', card: updated };
+    },
+    updateCardMeta: (cardId: string, patch: Record<string, unknown>) => {
+      const c = cards.get(cardId);
+      if (!c) return undefined;
+      const updated = { ...c, ...patch, revision: Number(c.revision ?? 0) + 1 };
+      cards.set(cardId, updated);
+      return updated;
+    },
+    addComment: (req: { cardId: string; kind: string; body: string }) => {
+      comments.push({ cardId: req.cardId, kind: req.kind, body: req.body });
+      return {};
+    },
+    getCard: (id: string) => cards.get(id),
+    snapshot: () => ({ cards: [...cards.values()] }),
+  });
+
+  const subDispatches: Array<{ agentOptions?: { provider?: string; model?: string; reasoningEffort?: string } }> = [];
+  ctx.provide('agents', { get: () => fakeRoot, list: () => [fakeRoot] });
+  ctx.provide('subagents', {
+    startActivation: async (opts: { agentOptions?: { provider?: string; model?: string; reasoningEffort?: string } }) => {
+      subDispatches.push({ agentOptions: opts.agentOptions });
+      return {
+        childId: 'child-exec-1',
+        result: Promise.resolve({ output: [{ type: 'text', text: 'done' }], stopReason: 'completed' }),
+        dispose: async () => {},
+      };
+    },
+  });
+
+  // Omit strategy to prove default is 'orchestrator'
+  const fiber = ctx.plugin(teamPlugin, { cadenceSteps: 4, twoStrikeThreshold: 2, retryBackoffMs: 1 });
+  await fiber;
+
+  try {
+    assert.equal(ctx.nsTeam!.strategy, 'orchestrator');
+
+    // 1. Pre-step step 1 enters planning phase on capable plannerRoute & blocks mutating tools
+    await ctx.waterfall(
+      'agent/pre-step',
+      { agent: fakeRoot, messages: [], turn: 1, step: 1, signal: AbortSignal.timeout(5000), modelSelection: curModel as never },
+      async () => ({ kind: 'enter' as const, messages: [] }),
+    );
+    assert.equal(selections.at(-1)?.reasoningEffort, 'high');
+    assert.ok(ctx.tools.checkGuards({ name: 'edit_file', agent: fakeRoot, arguments: {} } as never));
+    assert.ok(ctx.tools.checkGuards({ name: 'bash', agent: fakeRoot, arguments: { command: 'rm -rf tmp' } } as never));
+    assert.equal(ctx.tools.checkGuards({ name: 'bash', agent: fakeRoot, arguments: { command: 'node --test 2>&1' } } as never), undefined);
+    // Child sessions bypass root planning lock
+    assert.equal(ctx.tools.checkGuards({ name: 'edit_file', agent: childWorker, arguments: {} } as never), undefined);
+
+    // 2. propose_work assigns per-card modelTier; dispatch_worker honors it on attempt 1
+    const proposeTool = ctx.tools.get('propose_work')!;
+    await proposeTool.execute(
+      {
+        cards: [
+          { id: 'c-mech', title: 'Rename helper variable', writeScopes: ['src/a.ts'] },
+          { id: 'c-hard', title: 'Fix token race condition in auth', writeScopes: ['src/auth.ts'] },
+        ],
+      },
+      { agent: fakeRoot, signal: AbortSignal.timeout(5000) } as never,
+    );
+    assert.equal(cards.get('c-mech')?.modelTier, 'efficient');
+    assert.equal(cards.get('c-hard')?.modelTier, 'capable');
+
+    // 3. exit_plan_mode logs plan on Kanban and flips to fast efficient executor
+    const exitTool = ctx.tools.get('exit_plan_mode')!;
+    const handoff = (await exitTool.execute(
+      { plan: 'Step 1: fix mechanical card\nStep 2: verify', executionTier: 'efficient' },
+      { agent: fakeRoot, signal: AbortSignal.timeout(5000) } as never,
+    )) as { phase: string; cardId: string };
+    assert.equal(handoff.phase, 'executing');
+    assert.ok(comments.some((c) => c.kind === 'plan' && c.body.includes('[ORCHESTRATOR PLAN HANDOFF #1]')));
+
+    await ctx.waterfall(
+      'agent/pre-step',
+      { agent: fakeRoot, messages: [], turn: 1, step: 2, signal: AbortSignal.timeout(5000), modelSelection: curModel as never },
+      async () => ({ kind: 'enter' as const, messages: [] }),
+    );
+    assert.equal(selections.at(-1)?.reasoningEffort, 'low');
+    assert.equal(ctx.tools.checkGuards({ name: 'edit_file', agent: fakeRoot, arguments: {} } as never), undefined);
+
+    // 4. Per-card dispatch_worker uses card's own tier on attempt 1
+    const dispatchTool = ctx.tools.get('dispatch_worker')!;
+    await dispatchTool.execute(
+      { cardId: 'c-mech', task: 'Do mechanical edit', useWorktree: false, testCommand: `${process.execPath} -e "process.exit(0)"` },
+      { agent: fakeRoot, signal: AbortSignal.timeout(10_000) } as never,
+    );
+    await dispatchTool.execute(
+      { cardId: 'c-hard', task: 'Fix auth race', useWorktree: false, testCommand: `${process.execPath} -e "process.exit(0)"` },
+      { agent: fakeRoot, signal: AbortSignal.timeout(10_000) } as never,
+    );
+    assert.equal(subDispatches[0].agentOptions?.reasoningEffort, 'low');
+    assert.equal(subDispatches[1].agentOptions?.reasoningEffort, 'high');
+
+    // 5. 2-strike failure automatically returns to planning on capable planner and annotates Kanban card
+    ctx.emit('tools/result', { name: 'edit_file', arguments: {}, agent: fakeRoot } as never, { isError: true, content: [{ type: 'text', text: 'err 1' }] } as never);
+    ctx.emit('tools/result', { name: 'bash', arguments: { command: 'node --test' }, agent: fakeRoot } as never, { isError: true, content: [{ type: 'text', text: 'FAIL exit code 1' }] } as never);
+    assert.equal(ctx.nsTeam!.getOrchestratorState('orch-root').phase, 'planning');
+    assert.ok(comments.some((c) => c.kind === 'status' && c.body.includes('[2-STRIKE RE-PLAN]')));
+    assert.ok(ctx.tools.checkGuards({ name: 'edit_file', agent: fakeRoot, arguments: {} } as never));
+
+    // 6. Mid-session quota exhaustion swaps provider cleanly in-place
+    const quotaRes = await ctx.waterfall(
+      'agent/request-error',
+      {
+        agent: fakeRoot,
+        turn: 1,
+        step: 3,
+        provider: 'google-antigravity',
+        failure: { code: 'QUOTA_EXCEEDED', message: 'Quota exhausted', status: 429 },
+        retryPolicy: undefined,
+        signal: AbortSignal.timeout(5000),
+      } as never,
+      async () => undefined,
+    );
+    assert.deepEqual(quotaRes, { kind: 'retry' });
+    assert.equal(selections.at(-1)?.provider, 'openai-codex');
+    assert.equal(selections.at(-1)?.model, 'gpt-6.1-terra');
+    assert.equal(selections.at(-1)?.reasoningEffort, 'high');
+    assert.ok(comments.some((c) => c.kind === 'status' && c.body.includes('[QUOTA FAILOVER]')));
+
+    // 7. Cadence review triggers after cadenceSteps (4) execution steps
+    await exitTool.execute({ plan: 'Resume execution phase 2' }, { agent: fakeRoot, signal: AbortSignal.timeout(5000) } as never);
+    for (let s = 4; s <= 7; s += 1) {
+      await ctx.waterfall(
+        'agent/pre-step',
+        { agent: fakeRoot, messages: [], turn: 1, step: s, signal: AbortSignal.timeout(5000), modelSelection: curModel as never },
+        async () => ({ kind: 'enter' as const, messages: [] }),
+      );
+    }
+    assert.equal(ctx.nsTeam!.getOrchestratorState('orch-root').phase, 'planning');
+    assert.ok(comments.some((c) => c.kind === 'status' && c.body.includes('[CADENCE REVIEW]')));
+
+    // 8. Clean stop auto-closes inline orch-* card in_progress -> done
+    await ctx.serial('agent/turn-stopping', { agent: fakeRoot, turn: 1, signal: new AbortController().signal } as never);
+    assert.equal(cards.get(handoff.cardId)?.column, 'done');
   } finally {
     await fiber.dispose();
     rmSync(repo, { recursive: true, force: true });

@@ -1,8 +1,26 @@
 import { Context } from '@deepseek-ai/cordis';
 import z from '@deepseek-ai/schemastery';
-import { StallWatchdog, SwitchyardStageRouter, type OcrGateResult, type SnapshotVerifyResult, type SwitchyardStrategy } from '../core/index.js';
+import { StallWatchdog, SwitchyardStageRouter, type OcrGateResult, type SnapshotVerifyResult, type SwitchyardStrategy, type SwitchyardTier } from '../core/index.js';
 export declare const name = "ns-team";
 export declare const inject: readonly ["tools", "agents", "subagents", "systemPrompt"];
+export type OrchestratorPhase = 'planning' | 'executing';
+export interface OrchestratorSessionState {
+    sessionId: string;
+    phase: OrchestratorPhase;
+    activeCardId?: string;
+    planSummary?: string;
+    replanIf?: string;
+    lastReplanReason?: string;
+    stepsSincePlan: number;
+    consecutiveFailures: number;
+    planHandoffs: number;
+    replans: number;
+    cadenceReviews: number;
+    lastTurnSeen?: number;
+    pendingReplanNotice?: string;
+    pendingCadenceNotice?: string;
+    createdInlineCardIds: string[];
+}
 export interface PluginConfig {
     strategy: SwitchyardStrategy;
     maxAdvisorCallsPerCard: number;
@@ -18,9 +36,11 @@ export interface PluginConfig {
     progressWatchLimit?: number;
     watchdogFollowupSettleMs?: number;
     maxDispatchAttempts?: number;
+    cadenceSteps?: number;
+    twoStrikeThreshold?: number;
 }
 export declare const Config: z<Schemastery.ObjectS<NoInfer<{
-    strategy: z<"switchyard-stage" | "subagent-team" | "hybrid", "switchyard-stage" | "subagent-team" | "hybrid", "defined">;
+    strategy: z<"orchestrator" | "switchyard-stage" | "subagent-team" | "hybrid", "orchestrator" | "switchyard-stage" | "subagent-team" | "hybrid", "defined">;
     maxAdvisorCallsPerCard: z<number, number, "defined">;
     requireHumanReviewApproval: z<boolean, boolean, "defined">;
     defaultTestCommand: z<string, string, "defined">;
@@ -34,8 +54,10 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
     progressWatchLimit: z<number, number, "defined">;
     watchdogFollowupSettleMs: z<number, number, "defined">;
     maxDispatchAttempts: z<number, number, "defined">;
+    cadenceSteps: z<number, number, "defined">;
+    twoStrikeThreshold: z<number, number, "defined">;
 }>>, Schemastery.ObjectT<NoInfer<{
-    strategy: z<"switchyard-stage" | "subagent-team" | "hybrid", "switchyard-stage" | "subagent-team" | "hybrid", "defined">;
+    strategy: z<"orchestrator" | "switchyard-stage" | "subagent-team" | "hybrid", "orchestrator" | "switchyard-stage" | "subagent-team" | "hybrid", "defined">;
     maxAdvisorCallsPerCard: z<number, number, "defined">;
     requireHumanReviewApproval: z<boolean, boolean, "defined">;
     defaultTestCommand: z<string, string, "defined">;
@@ -49,6 +71,8 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
     progressWatchLimit: z<number, number, "defined">;
     watchdogFollowupSettleMs: z<number, number, "defined">;
     maxDispatchAttempts: z<number, number, "defined">;
+    cadenceSteps: z<number, number, "defined">;
+    twoStrikeThreshold: z<number, number, "defined">;
 }>>, "plain">;
 export interface ReviewGateReport {
     cardId: string;
@@ -68,6 +92,43 @@ export interface ReviewGateReport {
 export interface NsTeamService {
     readonly router: SwitchyardStageRouter;
     readonly watchdog: StallWatchdog;
+    readonly strategy: SwitchyardStrategy;
+    getOrchestratorState(sessionId: string): OrchestratorSessionState;
+    exitPlanMode(input: {
+        sessionId: string;
+        plan: string;
+        replanIf?: string;
+        executionTier?: SwitchyardTier;
+        cards?: Array<Record<string, unknown>>;
+        preferredProvider?: string;
+    }): {
+        ok: boolean;
+        phase: OrchestratorPhase;
+        cardId?: string;
+        nextRoute: {
+            provider: string;
+            model: string;
+            reasoningEffort: string;
+        };
+        cardsCreated: number;
+    };
+    enterPlanMode(input: {
+        sessionId: string;
+        reason: string;
+        cardId?: string;
+        preferredProvider?: string;
+        kind?: 'manual' | 'two_strike' | 'cadence';
+    }): {
+        ok: boolean;
+        phase: OrchestratorPhase;
+        cardId?: string;
+        nextRoute: {
+            provider: string;
+            model: string;
+            reasoningEffort: string;
+        };
+        reason: string;
+    };
     runReviewGate(input: {
         cardId: string;
         repoDir: string;

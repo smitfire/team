@@ -579,7 +579,10 @@ test('Orchestrator default strategy enforces Plan->Kanban->Execute loop, 2-strik
     assert.equal(ctx.nsTeam!.getOrchestratorState('orch-root').phase, 'planning');
     assert.ok(comments.some((c) => c.kind === 'status' && c.body.includes('[CADENCE REVIEW]')));
 
-    // 8. Clean stop auto-closes inline orch-* card in_progress -> done
+    // 8. Pause in planning keeps inline card open; clean stop in executing closes inline orch-* card -> done
+    await ctx.serial('agent/turn-stopping', { agent: fakeRoot, turn: 1, signal: new AbortController().signal } as never);
+    assert.equal(cards.get(handoff.cardId)?.column, 'in_progress');
+    await exitTool.execute({ plan: 'Final verification step' }, { agent: fakeRoot, signal: AbortSignal.timeout(5000) } as never);
     await ctx.serial('agent/turn-stopping', { agent: fakeRoot, turn: 1, signal: new AbortController().signal } as never);
     assert.equal(cards.get(handoff.cardId)?.column, 'done');
   } finally {

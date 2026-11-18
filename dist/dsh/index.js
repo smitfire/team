@@ -235,6 +235,13 @@ export function apply(ctx, rawConfig = {}) {
         }
         return { ok: true, phase: st.phase, cardId: targetCardId, nextRoute, reason: input.reason };
     };
+    const resolveCardTier = (explicitTier, fallbackCardTier, inferInput) => {
+        if (explicitTier === 'capable' || explicitTier === 'efficient')
+            return explicitTier;
+        if (fallbackCardTier === 'capable' || fallbackCardTier === 'efficient')
+            return fallbackCardTier;
+        return router.inferCardTier(inferInput);
+    };
     const exitPlanModeImpl = (input) => {
         const plan = input.plan.trim();
         if (!plan)
@@ -251,14 +258,12 @@ export function apply(ctx, rawConfig = {}) {
                 const requestedId = typeof item.id === 'string' && item.id.trim() ? item.id.trim() : undefined;
                 const writeScopes = Array.isArray(item.writeScopes) ? item.writeScopes.map(String) : undefined;
                 const blockedBy = Array.isArray(item.blockedBy) ? item.blockedBy.map(String) : undefined;
-                const inferredTier = item.modelTier === 'capable' || item.modelTier === 'efficient'
-                    ? item.modelTier
-                    : router.inferCardTier({
-                        title: String(item.title ?? ''),
-                        description: typeof item.description === 'string' ? item.description : undefined,
-                        writeScopes,
-                        blockedBy,
-                    });
+                const inferredTier = resolveCardTier(item.modelTier, undefined, {
+                    title: String(item.title ?? ''),
+                    description: typeof item.description === 'string' ? item.description : undefined,
+                    writeScopes,
+                    blockedBy,
+                });
                 const existing = requestedId ? board.getCard(requestedId) : undefined;
                 if (existing) {
                     board.updateCardMeta?.(existing.id, { phase: 'planning', modelTier: inferredTier });
@@ -618,7 +623,7 @@ export function apply(ctx, rawConfig = {}) {
         if (strategy === 'orchestrator' && isRootAgentSession(agent, childRepeatCounts)) {
             const ost = orchestratorSessions.get(sid);
             const board = getBoard();
-            if (ost && board) {
+            if (ost && board && ost.phase === 'executing') {
                 for (const cid of ost.createdInlineCardIds) {
                     const card = board.getCard(cid);
                     if (card && card.column === 'in_progress' && !activeDispatchCardIds.has(cid)) {
@@ -1004,14 +1009,12 @@ export function apply(ctx, rawConfig = {}) {
             for (const item of list) {
                 const writeScopes = Array.isArray(item.writeScopes) ? item.writeScopes.map(String) : undefined;
                 const blockedBy = Array.isArray(item.blockedBy) ? item.blockedBy.map(String) : undefined;
-                const modelTier = item.modelTier === 'capable' || item.modelTier === 'efficient'
-                    ? item.modelTier
-                    : router.inferCardTier({
-                        title: String(item.title ?? ''),
-                        description: typeof item.description === 'string' ? item.description : undefined,
-                        writeScopes,
-                        blockedBy,
-                    });
+                const modelTier = resolveCardTier(item.modelTier, undefined, {
+                    title: String(item.title ?? ''),
+                    description: typeof item.description === 'string' ? item.description : undefined,
+                    writeScopes,
+                    blockedBy,
+                });
                 created.push(board.proposeCard({
                     id: typeof item.id === 'string' ? item.id : undefined,
                     title: String(item.title ?? ''),
@@ -1044,11 +1047,10 @@ export function apply(ctx, rawConfig = {}) {
             const board = getBoard();
             const cardId = String(args.cardId);
             const existingCard = board?.getCard(cardId);
-            const initialTier = args.modelTier === 'capable' || args.modelTier === 'efficient'
-                ? args.modelTier
-                : existingCard?.modelTier === 'capable' || existingCard?.modelTier === 'efficient'
-                    ? existingCard.modelTier
-                    : router.inferCardTier({ title: existingCard?.title ?? cardId, description: String(args.task) });
+            const initialTier = resolveCardTier(args.modelTier, existingCard?.modelTier, {
+                title: existingCard?.title ?? cardId,
+                description: String(args.task),
+            });
             const repoRoot = workspaceRootOf(exec.agent);
             const inGitRepo = existsSync(join(repoRoot, '.git'));
             const useWorktree = args.useWorktree !== false && inGitRepo;

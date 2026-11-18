@@ -228,8 +228,7 @@ export class SwitchyardStageRouter {
         : [this.cfg.fallbackEfficientRoute, this.cfg.efficientRoute];
     const alt = candidates.find((c) => c.provider !== failedProvider && this.isProviderHealthy(c.provider));
     if (alt) return alt;
-    const anyHealthy = candidates.find((c) => this.isProviderHealthy(c.provider));
-    return anyHealthy ?? candidates.find((c) => c.provider !== failedProvider) ?? candidates[0];
+    return candidates.find((c) => c.provider !== failedProvider) ?? candidates[0];
   }
 
   /**
@@ -345,7 +344,7 @@ export class SwitchyardStageRouter {
       !input.isError &&
       !testFailed &&
       ((testPassed && this.cfg.earlyReleaseOnVerifyPass) ||
-        st.holdRemaining === 0 && st.consecutiveCleanSteps >= this.cfg.deescalateAfterCleanSteps)
+        (st.holdRemaining === 0 && st.consecutiveCleanSteps >= this.cfg.deescalateAfterCleanSteps))
     ) {
       const route = this.resolveRoute('efficient', input.preferredProvider);
       st.activeTier = 'efficient';

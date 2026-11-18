@@ -45,8 +45,22 @@ export class ProgressWatch {
         this.tripped = false;
     }
 }
+const QUOTA_OR_RATE_LIMIT_CODES = new Set([
+    'RATE_LIMIT',
+    'QUOTA',
+    'QUOTA_EXCEEDED',
+    'ACCOUNT_QUOTA',
+    'RESOURCE_EXHAUSTED',
+    'MODEL_CAPACITY_EXHAUSTED',
+]);
+const QUOTA_OR_RATE_LIMIT_MSG_RE = /\b(?:rate[-_ ]?limit|too many requests|quota(?:[_\s-]+)?exceeded|account(?:[_\s-]+)?quota|resource[-_ ]?exhausted|model(?:[_\s-]+)?capacity(?:[_\s-]+)?exhausted|429)\b/i;
 const RETRYABLE_CODES = new Set([
     'RATE_LIMIT',
+    'QUOTA',
+    'QUOTA_EXCEEDED',
+    'ACCOUNT_QUOTA',
+    'RESOURCE_EXHAUSTED',
+    'MODEL_CAPACITY_EXHAUSTED',
     'TIMEOUT',
     'NETWORK',
     'SERVER_ERROR',
@@ -69,7 +83,7 @@ const NON_RETRYABLE_CODES = new Set([
 ]);
 const RETRYABLE_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 const NON_RETRYABLE_STATUSES = new Set([400, 401, 403, 404, 422]);
-const RETRYABLE_MSG_RE = /\b(?:rate[-_ ]?limit|too many requests|timed? ?out|etimedout|econnreset|fetch failed|overloaded|stream closed|temporarily unavailable|internal server error|bad gateway|gateway timeout)\b/i;
+const RETRYABLE_MSG_RE = /\b(?:rate[-_ ]?limit|too many requests|quota(?:[_\s-]+)?exceeded|account(?:[_\s-]+)?quota|resource[-_ ]?exhausted|timed? ?out|etimedout|econnreset|fetch failed|overloaded|stream closed|temporarily unavailable|internal server error|bad gateway|gateway timeout)\b/i;
 const NON_RETRYABLE_MSG_RE = /\b(?:unauthorized|invalid api key|forbidden|cuga|cuga_policy_deny|permission|validation|user cancel(?:led|ed)?|aborted by user|user_abort(?:ed)?|user_cancel(?:led|ed)?)\b/i;
 /**
  * Shared predicate identifying user-initiated cancellation / abort failure codes.
@@ -140,6 +154,25 @@ export function isRetryableUpstreamFailure(errOrFailure) {
     if (NON_RETRYABLE_MSG_RE.test(message))
         return false;
     return RETRYABLE_MSG_RE.test(message);
+}
+/**
+ * Identify upstream HTTP 429 / quota / capacity exhaustion failures eligible for cross-provider model failover.
+ */
+export function isQuotaOrRateLimitFailure(errOrFailure) {
+    if (!errOrFailure || isDeterministicFailure(errOrFailure))
+        return false;
+    if (typeof errOrFailure === 'string') {
+        return QUOTA_OR_RATE_LIMIT_MSG_RE.test(errOrFailure);
+    }
+    if (typeof errOrFailure !== 'object')
+        return false;
+    const obj = errOrFailure;
+    const code = typeof obj.code === 'string' ? obj.code.toUpperCase() : '';
+    const status = typeof obj.status === 'number' ? obj.status : undefined;
+    const message = typeof obj.message === 'string' ? obj.message : '';
+    if (status === 429 || QUOTA_OR_RATE_LIMIT_CODES.has(code))
+        return true;
+    return QUOTA_OR_RATE_LIMIT_MSG_RE.test(message);
 }
 /**
  * Construct an immutable frozen DSH UserMessage structurally matching `Agent['steer']`.

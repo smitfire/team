@@ -15,7 +15,7 @@ export declare class ProgressWatch {
     isTripped(): boolean;
     reset(): void;
 }
-export type WatchdogEventKind = 'max_tokens_continue' | 'request_error_retry' | 'idle_stall_recover' | 'subagent_cold_resume' | 'board_orphan_reconciled' | 'loop_cap_reached';
+export type WatchdogEventKind = 'max_tokens_continue' | 'request_error_retry' | 'quota_model_swap' | 'idle_stall_recover' | 'subagent_cold_resume' | 'board_orphan_reconciled' | 'orchestrator_replan' | 'orchestrator_cadence_review' | 'loop_cap_reached';
 export interface WatchdogEvent {
     readonly id: string;
     readonly timestamp: number;
@@ -58,6 +58,10 @@ export declare function isDeterministicFailure(errOrFailure: unknown): boolean;
  * Explicit structured error codes and HTTP statuses take precedence over message text.
  */
 export declare function isRetryableUpstreamFailure(errOrFailure: unknown): boolean;
+/**
+ * Identify upstream HTTP 429 / quota / capacity exhaustion failures eligible for cross-provider model failover.
+ */
+export declare function isQuotaOrRateLimitFailure(errOrFailure: unknown): boolean;
 /**
  * Construct an immutable frozen DSH UserMessage structurally matching `Agent['steer']`.
  * Cast is isolated here because `@deepseek-ai/dsh-agent` leaves `UserMessage.id` branded at type level.

@@ -3,6 +3,7 @@ import { realpathSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { pathToFileURL } from 'node:url';
 import {
+  classifyToolSemantics,
   generateSwitchyardRoutesToml,
   runOcrDiffReview,
   selectCrossFamilyReviewer,
@@ -13,7 +14,7 @@ import {
 const MCP_TOOLS = [
   {
     name: 'switchyard_evaluate',
-    description: 'Record a tool outcome into NVIDIA NeMo Switchyard StageRouter and return recommended model tier/route.',
+    description: 'Record a tool outcome into NVIDIA NeMo Switchyard StageRouter (with tool_semantics) or infer card modelTier.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -22,6 +23,8 @@ const MCP_TOOLS = [
         argsSummary: { type: 'string' },
         isError: { type: 'boolean' },
         outputPreview: { type: 'string' },
+        cardTitle: { type: 'string' },
+        cardDescription: { type: 'string' },
       },
       required: ['toolName', 'isError'],
     },
@@ -80,13 +83,25 @@ export async function startMcpServer(workspaceRoot = process.cwd()): Promise<voi
         if (!args || typeof args !== 'object' || Array.isArray(args)) throw new RpcError(-32602, 'arguments must be an object');
         let result: unknown;
         if (name === 'switchyard_evaluate') {
-          result = router.recordToolOutcome({
+          const outcome = router.recordToolOutcome({
             sessionId: String(args.sessionId ?? 'default'),
             toolName: String(args.toolName ?? ''),
             argsSummary: String(args.argsSummary ?? ''),
             isError: Boolean(args.isError),
             outputPreview: typeof args.outputPreview === 'string' ? args.outputPreview : undefined,
           });
+          result = {
+            ...outcome,
+            semantics: classifyToolSemantics(String(args.toolName ?? ''), String(args.argsSummary ?? '')),
+            ...(typeof args.cardTitle === 'string'
+              ? {
+                  inferredCardTier: router.inferCardTier({
+                    title: args.cardTitle,
+                    description: typeof args.cardDescription === 'string' ? args.cardDescription : undefined,
+                  }),
+                }
+              : {}),
+          };
         } else if (name === 'review_worktree_gate') {
           const skipOcr = args.runOcr === false;
           const [snapshot, ocr] = await Promise.all([

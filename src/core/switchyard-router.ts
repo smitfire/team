@@ -61,7 +61,7 @@ export const DEFAULT_SWITCHYARD_CONFIG: SwitchyardConfig = {
   strategy: 'orchestrator',
   plannerRoute: {
     provider: 'google-antigravity',
-    model: 'antigravity-gemini-3.8-flash',
+    model: 'antigravity-gemini-4-hydrogen',
     reasoningEffort: 'high',
   },
   fallbackPlannerRoute: {
@@ -71,12 +71,12 @@ export const DEFAULT_SWITCHYARD_CONFIG: SwitchyardConfig = {
   },
   efficientRoute: {
     provider: 'google-antigravity',
-    model: 'antigravity-gemini-3.8-flash',
+    model: 'antigravity-gemini-4-hydrogen',
     reasoningEffort: 'low',
   },
   capableRoute: {
     provider: 'google-antigravity',
-    model: 'antigravity-gemini-3.8-flash',
+    model: 'antigravity-gemini-4-hydrogen',
     reasoningEffort: 'high',
   },
   fallbackEfficientRoute: {

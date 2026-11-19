@@ -61,6 +61,8 @@ test('NVIDIA NeMo Switchyard StageRouter escalates on failures and de-escalates 
   const toml = generateSwitchyardRoutesToml();
   assert.match(toml, /strategy = "stage_router"/);
   assert.match(toml, /\[targets\.capable\]/);
+  assert.equal(DEFAULT_SWITCHYARD_CONFIG.efficientRoute.model, 'antigravity-gemini-4-hydrogen');
+  assert.doesNotMatch(toml, /argon|3\.8-flash/);
 });
 
 test('selectCrossFamilyReviewer pairs OpenAI <-> Gemini and warns on single-family fallback', () => {
@@ -111,9 +113,9 @@ test('DSH ns-team plugin wires Switchyard agent/pre-step model switching and Rev
   const selectedModels: unknown[] = [];
   const fakeAgent = {
     session: { id: 'sess-lead', meta: { cwd: repo } },
-    options: { provider: 'google-antigravity', model: 'antigravity-gemini-3.8-flash' },
+    options: { provider: 'google-antigravity', model: 'antigravity-gemini-4-hydrogen' },
     model: {
-      current: () => ({ provider: 'google-antigravity', model: 'antigravity-gemini-3.8-flash' }),
+      current: () => ({ provider: 'google-antigravity', model: 'antigravity-gemini-4-hydrogen' }),
       select: (sel: unknown) => selectedModels.push(sel),
     },
   } as never;
@@ -139,7 +141,7 @@ test('DSH ns-team plugin wires Switchyard agent/pre-step model switching and Rev
         turn: 1,
         step: 2,
         signal: AbortSignal.timeout(5000),
-        modelSelection: { provider: 'google-antigravity', model: 'antigravity-gemini-3.8-flash' } as never,
+        modelSelection: { provider: 'google-antigravity', model: 'antigravity-gemini-4-hydrogen' } as never,
       },
       async () => ({ kind: 'enter' as const, messages: [] }),
     );
@@ -226,9 +228,9 @@ test('ProgressWatch, StallWatchdog exemptions, max-tokens steer, request-error r
   const fakeAgent = {
     id: 'sess-wd',
     session: { id: 'sess-wd', meta: { cwd: repo } },
-    options: { provider: 'google-antigravity', model: 'antigravity-gemini-3.8-flash' },
+    options: { provider: 'google-antigravity', model: 'antigravity-gemini-4-hydrogen' },
     model: {
-      current: () => ({ provider: 'google-antigravity', model: 'antigravity-gemini-3.8-flash' }),
+      current: () => ({ provider: 'google-antigravity', model: 'antigravity-gemini-4-hydrogen' }),
       select: () => {},
     },
     steer: (m: unknown) => steered.push(m),
@@ -409,11 +411,11 @@ test('Orchestrator default strategy enforces Plan->Kanban->Execute loop, 2-strik
   await ctx.plugin(ToolsService);
 
   const selections: Array<{ provider?: string; model?: string; reasoningEffort?: string }> = [];
-  let curModel = { provider: 'google-antigravity', model: 'antigravity-gemini-3.8-flash', reasoningEffort: 'low' };
+  let curModel = { provider: 'google-antigravity', model: 'antigravity-gemini-4-hydrogen', reasoningEffort: 'low' };
   const fakeRoot = {
     id: 'orch-root',
     session: { id: 'orch-root', header: {}, meta: { cwd: repo } },
-    options: { provider: 'google-antigravity', model: 'antigravity-gemini-3.8-flash' },
+    options: { provider: 'google-antigravity', model: 'antigravity-gemini-4-hydrogen' },
     model: {
       current: () => curModel,
       select: (sel: { provider: string; model: string; reasoningEffort?: string }) => {

@@ -53,6 +53,13 @@ export interface SwitchyardConfig {
 }
 export declare const DEFAULT_SWITCHYARD_CONFIG: SwitchyardConfig;
 /**
+ * Heuristic gate choosing Planner (`high` + Kanban plan) vs Direct Fast-Path (`low`, immediate tools).
+ */
+export declare function shouldPlanTurn(prompt: string, opts?: {
+    manualPlanPinned?: boolean;
+    hasPendingReviewOrReplan?: boolean;
+}): boolean;
+/**
  * Classify a tool call into NeMo Switchyard `tool_semantics` categories.
  */
 export declare function classifyToolSemantics(toolName: string, argsSummary?: string): ToolSemanticCategory;

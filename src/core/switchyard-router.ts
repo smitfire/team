@@ -109,6 +109,48 @@ const PTC_MUTATE_RE = /\b(?:writeFile(?:Sync)?|appendFile(?:Sync)?|rm(?:Sync)?|u
 const CAPABLE_CARD_SIGNAL_RE =
   /\b(?:architect|design|plan|concurren\w*|race|security|auth\w*|token|migrat\w*|refactor|deadlock|retry|failover|debug|recover|investigat\w*|orchestrat\w*|contract)\b/i;
 
+const PLAN_EXPLICIT_RE = /\b(?:plan|architect\w*|design|orchestrat\w*|decompose|kanban|subagent\w*|parallel|roadmap|rfc|spec)\b/i;
+const PLAN_HIGH_RISK_RE =
+  /\b(?:concurren\w*|race\s+condition|deadlock|security|auth\w*|migrat\w*|multi[-\s]?file|end[-\s]?to[-\s]?end|e2e|rollback|failover)\b/i;
+const PLAN_REFACTOR_ACROSS_RE = /\brefactor\b[\s\S]{0,60}\bacross\b/i;
+const PLAN_LONG_ACTION_RE = /\b(?:implement|build|create|add|refactor|rewrite|replace|fix|update|integrate)\b/i;
+const PLAN_LIST_LINE_RE = /^\s*(?:[-*]|\d+[.)])\s+/gm;
+const PLAN_PATH_TOKEN_RE =
+  /(?:^|[\s`"'(])((?:[A-Za-z0-9._-]+\/)+[A-Za-z0-9._-]+(?:\.[A-Za-z0-9]+)?|\b[A-Za-z0-9_-]+\.(?:[cm]?[jt]sx?|py|rs|go|java|rb|sql|yml|yaml|toml|json|md|sh)\b)/g;
+
+/**
+ * Heuristic gate choosing Planner (`high` + Kanban plan) vs Direct Fast-Path (`low`, immediate tools).
+ */
+export function shouldPlanTurn(
+  prompt: string,
+  opts: { manualPlanPinned?: boolean; hasPendingReviewOrReplan?: boolean } = {},
+): boolean {
+  if (opts.manualPlanPinned || opts.hasPendingReviewOrReplan) return true;
+  const trimmed = prompt.trim();
+  if (trimmed.length === 0) return true;
+  if (PLAN_EXPLICIT_RE.test(trimmed) || PLAN_HIGH_RISK_RE.test(trimmed) || PLAN_REFACTOR_ACROSS_RE.test(trimmed)) {
+    return true;
+  }
+  const bulletCount = (trimmed.match(PLAN_LIST_LINE_RE) ?? []).length;
+  if (bulletCount >= 3) return true;
+  if (trimmed.length >= 360 && PLAN_LONG_ACTION_RE.test(trimmed)) return true;
+
+  const paths = new Set<string>();
+  const pathRe = new RegExp(PLAN_PATH_TOKEN_RE.source, 'g');
+  for (const m of trimmed.matchAll(pathRe)) {
+    const raw = m[1];
+    if (!raw) continue;
+    const matchIndex = m.index ?? 0;
+    const prefixStart = matchIndex + m[0].length - raw.length;
+    const before = trimmed.slice(Math.max(0, prefixStart - 3), prefixStart);
+    if (before.endsWith('://') || before.endsWith(':/')) continue;
+    const normalized = raw.replace(/^[`"'(]+|[.,;:!?`"')]+$/g, '').toLowerCase();
+    if (normalized) paths.add(normalized);
+    if (paths.size >= 2) return true;
+  }
+  return false;
+}
+
 /**
  * Classify a tool call into NeMo Switchyard `tool_semantics` categories.
  */

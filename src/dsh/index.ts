@@ -21,6 +21,7 @@ import {
   removeIsolatedWorktree,
   runOcrDiffReview,
   selectCrossFamilyReviewer,
+  shouldPlanTurn,
   StallWatchdog,
   SwitchyardStageRouter,
   verifySnapshotTests,
@@ -81,6 +82,35 @@ function preferredProviderOf(agent: Agent | undefined): string | undefined {
   return agent?.model?.current?.()?.provider ?? agent?.options?.provider;
 }
 
+function extractMessageText(msg: unknown): string {
+  if (!msg || typeof msg !== 'object') return '';
+  const m = msg as { role?: unknown; content?: unknown; source?: { kind?: unknown } };
+  if (m.role !== undefined && m.role !== 'user') return '';
+  let text = '';
+  if (typeof m.content === 'string') {
+    text = m.content;
+  } else if (Array.isArray(m.content)) {
+    text = m.content
+      .filter((b): b is { type?: unknown; text?: unknown } => Boolean(b) && typeof b === 'object')
+      .filter((b) => (b.type === undefined || b.type === 'text') && typeof b.text === 'string')
+      .map((b) => String(b.text))
+      .join(' ');
+  }
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.startsWith('[Auto-Continue ') || trimmed.startsWith('[Auto-Resume Watchdog ')) {
+    return '';
+  }
+  return trimmed;
+}
+
+function extractUserTextFromMessages(messages: readonly unknown[]): string {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const t = extractMessageText(messages[i]);
+    if (t) return t;
+  }
+  return '';
+}
+
 function isRootAgentSession(agent: Agent | undefined, knownChildIds: { has(id: string): boolean }): boolean {
   if (!agent) return false;
   const sid = String(agent.session.id);
@@ -118,6 +148,9 @@ export type OrchestratorPhase = 'planning' | 'executing';
 export interface OrchestratorSessionState {
   sessionId: string;
   phase: OrchestratorPhase;
+  fastPathTurn?: boolean;
+  manualPlanPinned?: boolean;
+  lastClassifiedMsgKey?: string;
   activeCardId?: string;
   planSummary?: string;
   replanIf?: string;
@@ -135,6 +168,7 @@ export interface OrchestratorSessionState {
 
 export interface PluginConfig {
   strategy: SwitchyardStrategy;
+  adaptiveFastPath?: boolean;
   maxAdvisorCallsPerCard: number;
   requireHumanReviewApproval: boolean;
   defaultTestCommand: string;
@@ -156,6 +190,7 @@ export const Config = z.object({
   strategy: z
     .union([z.const('orchestrator'), z.const('switchyard-stage'), z.const('subagent-team'), z.const('hybrid')])
     .default('orchestrator'),
+  adaptiveFastPath: z.boolean().default(true),
   maxAdvisorCallsPerCard: z.number().default(TEAM_DEFAULTS.maxAdvisorCallsPerCard),
   requireHumanReviewApproval: z.boolean().default(false),
   defaultTestCommand: z.string().default('npm test'),
@@ -286,6 +321,9 @@ function workspaceRootOf(agent?: Agent): string {
 export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void {
   const strategy: SwitchyardStrategy =
     parseStrategy(process.env.NS_TEAM_STRATEGY?.trim()) ?? parseStrategy(rawConfig.strategy) ?? 'orchestrator';
+  const rawAdaptiveEnv = process.env.NS_TEAM_ADAPTIVE_FAST_PATH?.trim().toLowerCase();
+  const adaptiveFastPath =
+    rawAdaptiveEnv === '0' || rawAdaptiveEnv === 'false' ? false : (rawConfig.adaptiveFastPath ?? true);
   const maxAdvisorCallsPerCard = clampInt(rawConfig.maxAdvisorCallsPerCard, TEAM_DEFAULTS.maxAdvisorCallsPerCard, 0, 20);
   const requireHumanReviewApproval = rawConfig.requireHumanReviewApproval ?? false;
   const defaultTestCommand = rawConfig.defaultTestCommand ?? 'npm test';
@@ -376,6 +414,8 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
     const kind = input.kind ?? 'manual';
     const nextRoute = router.resolvePlannerRoute(input.preferredProvider);
     st.phase = 'planning';
+    st.fastPathTurn = false;
+    if (kind === 'manual') st.manualPlanPinned = true;
     st.stepsSincePlan = 0;
     st.consecutiveFailures = 0;
     st.lastReplanReason = input.reason;
@@ -530,6 +570,8 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
     }
 
     st.phase = 'executing';
+    st.fastPathTurn = false;
+    st.manualPlanPinned = false;
     st.planSummary = plan.slice(0, 1200);
     st.replanIf = input.replanIf?.trim();
     st.stepsSincePlan = 0;
@@ -721,7 +763,7 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
             ? router.resolvePlannerRoute(provider)
             : router.resolveRoute(st.activeTier, provider);
         lines.push(
-          `<orchestrator-protocol strategy="orchestrator" phase="${orch.phase}" route="${activeRoute.provider}/${activeRoute.model}:${activeRoute.reasoningEffort}" card="${orch.activeCardId ?? 'none'}" step="${orch.stepsSincePlan}/${cadenceSteps}" strikes="${orch.consecutiveFailures}/${twoStrikeThreshold}">`,
+          `<orchestrator-protocol strategy="orchestrator" phase="${orch.phase}"${orch.fastPathTurn ? ' mode="fast-path"' : ''} route="${activeRoute.provider}/${activeRoute.model}:${activeRoute.reasoningEffort}" card="${orch.activeCardId ?? 'none'}" step="${orch.stepsSincePlan}/${cadenceSteps}" strikes="${orch.consecutiveFailures}/${twoStrikeThreshold}">`,
         );
         if (orch.phase === 'planning') {
           lines.push(
@@ -733,6 +775,10 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
           if (orch.pendingCadenceNotice) {
             lines.push(`CADENCE REVIEW DUE: ${orch.pendingCadenceNotice}`);
           }
+        } else if (orch.fastPathTurn) {
+          lines.push(
+            'DIRECT FAST-PATH (efficient executor, tools unlocked): Handle directly without handoff_plan overhead. Call propose_work / enter_plan_mode only if you discover multi-module complexity.',
+          );
         } else {
           lines.push(
             `EXECUTING PHASE: Execute approved plan cleanly; propose/dispatch sub-cards with appropriate modelTier (efficient|capable), or call enter_plan_mode({ reason }) if assumptions fail.`,
@@ -852,11 +898,18 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
         }
       }
       if (ost) {
+        const wasFastPath = Boolean(ost.fastPathTurn);
         ost.phase = 'planning';
+        ost.fastPathTurn = false;
+        ost.lastClassifiedMsgKey = undefined;
         ost.stepsSincePlan = 0;
         ost.consecutiveFailures = 0;
+        if (!wasFastPath || ost.manualPlanPinned) {
+          applySessionRouteNow(sid, router.resolvePlannerRoute(preferredProviderOf(agent)), agent);
+        }
+      } else {
+        applySessionRouteNow(sid, router.resolvePlannerRoute(preferredProviderOf(agent)), agent);
       }
-      applySessionRouteNow(sid, router.resolvePlannerRoute(preferredProviderOf(agent)), agent);
     }
   });
 
@@ -1101,6 +1154,43 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
     }
   });
 
+  const applyAdaptiveTurnRouting = (
+    agent: Agent,
+    sid: string,
+    ost: OrchestratorSessionState,
+    userText: string,
+    msgKey?: string,
+    hasPendingOverride?: boolean,
+  ): void => {
+    const planNeeded = shouldPlanTurn(userText, {
+      manualPlanPinned: ost.manualPlanPinned,
+      hasPendingReviewOrReplan: hasPendingOverride ?? Boolean(ost.pendingReplanNotice || ost.pendingCadenceNotice),
+    });
+    ost.stepsSincePlan = 0;
+    ost.consecutiveFailures = 0;
+    if (msgKey) ost.lastClassifiedMsgKey = msgKey;
+    if (planNeeded) {
+      ost.phase = 'planning';
+      ost.fastPathTurn = false;
+      applySessionRouteNow(sid, router.resolvePlannerRoute(preferredProviderOf(agent)), agent);
+    } else {
+      ost.phase = 'executing';
+      ost.fastPathTurn = true;
+      router.stateFor(sid).activeTier = 'efficient';
+      applySessionRouteNow(sid, router.resolveRoute('efficient', preferredProviderOf(agent)), agent);
+    }
+  };
+
+  ctx.on('agent/inbox/inserted' as never, (({ agent, message }: { agent: Agent; message: unknown }) => {
+    if (strategy !== 'orchestrator' || !adaptiveFastPath || !isRootAgentSession(agent, childRepeatCounts)) return;
+    const userText = extractUserTextFromMessages([message]);
+    if (!userText) return;
+    const sid = String(agent.session.id);
+    const msgId = (message as { id?: unknown } | undefined)?.id;
+    const msgKey = String(msgId ?? userText.slice(0, 120));
+    applyAdaptiveTurnRouting(agent, sid, ensureOrchState(sid), userText, msgKey);
+  }) as never);
+
   ctx.on('agent/created' as never, (({ agent }: { agent: Agent }) => {
     if (strategy === 'orchestrator' && isRootAgentSession(agent, childRepeatCounts)) {
       const sid = String(agent.session.id);
@@ -1114,16 +1204,33 @@ export function apply(ctx: Context, rawConfig: Partial<PluginConfig> = {}): void
     const sid = String(payload.agent.session.id);
     if (strategy === 'orchestrator' && isRootAgentSession(payload.agent, childRepeatCounts)) {
       const ost = ensureOrchState(sid);
+      const userText = extractUserTextFromMessages(payload.messages as readonly unknown[]);
+      const firstId = (payload.messages[0] as { id?: unknown } | undefined)?.id;
+      const msgKey = userText ? String(firstId ?? userText.slice(0, 120)) : undefined;
       const isNewTurn = ost.lastTurnSeen !== undefined && payload.turn !== ost.lastTurnSeen;
       if (isNewTurn) {
-        ost.phase = 'planning';
-        ost.stepsSincePlan = 0;
-        ost.consecutiveFailures = 0;
+        const hadPending = Boolean(ost.pendingReplanNotice || ost.pendingCadenceNotice);
         ost.pendingCadenceNotice = undefined;
         ost.pendingReplanNotice = undefined;
-        applySessionRouteNow(sid, router.resolvePlannerRoute(preferredProviderOf(payload.agent)), payload.agent);
-      } else if (ost.lastTurnSeen === undefined && ost.phase === 'planning' && !pendingModelSwitch.has(sid)) {
-        applySessionRouteNow(sid, router.resolvePlannerRoute(preferredProviderOf(payload.agent)), payload.agent);
+        if (adaptiveFastPath && userText) {
+          if (ost.lastClassifiedMsgKey !== msgKey) {
+            applyAdaptiveTurnRouting(payload.agent, sid, ost, userText, msgKey, hadPending);
+          }
+        } else {
+          ost.phase = 'planning';
+          ost.fastPathTurn = false;
+          ost.stepsSincePlan = 0;
+          ost.consecutiveFailures = 0;
+          applySessionRouteNow(sid, router.resolvePlannerRoute(preferredProviderOf(payload.agent)), payload.agent);
+        }
+      } else if (ost.lastTurnSeen === undefined) {
+        if (adaptiveFastPath && userText) {
+          if (ost.lastClassifiedMsgKey !== msgKey) {
+            applyAdaptiveTurnRouting(payload.agent, sid, ost, userText, msgKey);
+          }
+        } else if (ost.phase === 'planning' && !pendingModelSwitch.has(sid)) {
+          applySessionRouteNow(sid, router.resolvePlannerRoute(preferredProviderOf(payload.agent)), payload.agent);
+        }
       }
       ost.lastTurnSeen = payload.turn;
 

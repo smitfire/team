@@ -18,6 +18,7 @@ import {
   ProgressWatch,
   removeIsolatedWorktree,
   selectCrossFamilyReviewer,
+  shouldPlanTurn,
   StallWatchdog,
   SwitchyardStageRouter,
   verifySnapshotTests,
@@ -594,5 +595,115 @@ test('Orchestrator default strategy enforces Plan->Kanban->Execute loop, 2-strik
   } finally {
     await fiber.dispose();
     rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('shouldPlanTurn and Orchestrator adaptiveFastPath route simple turns directly to low executor and escalate when needed', async () => {
+  // Pure classifier assertions
+  assert.equal(shouldPlanTurn('Reply with the single word READY and do not touch any files.'), false);
+  assert.equal(shouldPlanTurn('Fix typo in README.md'), false);
+  assert.equal(shouldPlanTurn('What does bin/ns-dsh.mjs do?'), false);
+  assert.equal(shouldPlanTurn(''), true);
+  assert.equal(shouldPlanTurn('Fix typo in README.md', { manualPlanPinned: true }), true);
+  assert.equal(shouldPlanTurn('Fix typo in README.md', { hasPendingReviewOrReplan: true }), true);
+  assert.equal(shouldPlanTurn('Fix the bug in src/a.ts and update src/b.ts'), true);
+  assert.equal(shouldPlanTurn('Design a migration strategy for session storage'), true);
+  assert.equal(shouldPlanTurn('Fix token race condition in cache.ts'), true);
+  assert.equal(shouldPlanTurn('- step 1\n- step 2\n- step 3'), true);
+
+  const ctx = new Context();
+  await ctx.plugin(SystemPrompt);
+  await ctx.plugin(ToolsService);
+  let curModel = { provider: 'google-antigravity', model: 'antigravity-gemini-4-hydrogen', reasoningEffort: 'high' };
+  const fakeRoot = {
+    id: 'adaptive-root',
+    session: { id: 'adaptive-root', header: {}, meta: { cwd: process.cwd() } },
+    options: { provider: 'google-antigravity', model: 'antigravity-gemini-4-hydrogen' },
+    model: {
+      current: () => curModel,
+      select: (sel: { provider: string; model: string; reasoningEffort?: string }) => {
+        curModel = { provider: sel.provider, model: sel.model, reasoningEffort: sel.reasoningEffort ?? 'low' };
+      },
+    },
+  } as never;
+  const createdCards: string[] = [];
+  ctx.provide('nsBoard', {
+    proposeCard: (req: Record<string, unknown>) => {
+      const id = String(req.id || `c_${createdCards.length + 1}`);
+      createdCards.push(id);
+      return { card: { id, revision: 1, column: 'ready' }, scopeConflicts: [] };
+    },
+    moveCard: () => ({ ok: true, status: 'moved', card: { id: 'x', revision: 2 } }),
+    addComment: () => ({}),
+    getCard: () => undefined,
+  });
+  ctx.provide('agents', { get: () => fakeRoot, list: () => [fakeRoot] });
+  ctx.provide('subagents', {
+    startActivation: async () => ({
+      childId: 'adaptive-child-1',
+      result: Promise.resolve({ output: [{ type: 'text', text: 'ok' }], stopReason: 'completed' }),
+      dispose: async () => {},
+    }),
+  });
+
+  const fiber = ctx.plugin(teamPlugin, { twoStrikeThreshold: 2 });
+  await fiber;
+  try {
+    await ctx.serial('agent/created' as never, { agent: fakeRoot, source: 'startup' } as never);
+    assert.equal(curModel.reasoningEffort, 'high');
+
+    // Simple prompt arriving via inbox switches immediately to efficient/low with mutating tools unlocked
+    await ctx.serial('agent/inbox/inserted' as never, {
+      agent: fakeRoot,
+      message: { id: 'msg-fast-1', role: 'user', content: [{ type: 'text', text: 'Fix typo in README.md' }] },
+    } as never);
+    await ctx.waterfall(
+      'agent/pre-step',
+      {
+        agent: fakeRoot,
+        messages: [{ id: 'msg-fast-1' as never, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'Fix typo in README.md' }] } as never],
+        turn: 1,
+        step: 1,
+        signal: AbortSignal.timeout(2000),
+        modelSelection: curModel as never,
+      },
+      async () => ({ kind: 'enter' as const, messages: [] }),
+    );
+    assert.equal(curModel.reasoningEffort, 'low');
+    assert.equal(ctx.nsTeam!.getOrchestratorState('adaptive-root').phase, 'executing');
+    assert.equal(ctx.nsTeam!.getOrchestratorState('adaptive-root').fastPathTurn, true);
+    assert.equal(ctx.tools.checkGuards({ name: 'edit_file', agent: fakeRoot, arguments: {} } as never), undefined);
+    assert.equal(createdCards.length, 0);
+
+    // 2 consecutive failures on fast-path escalate to high Planner
+    ctx.emit('tools/result', { name: 'edit_file', arguments: {}, agent: fakeRoot } as never, { isError: true, content: [] } as never);
+    ctx.emit('tools/result', { name: 'bash', arguments: { command: 'npm test' }, agent: fakeRoot } as never, { isError: true, content: [] } as never);
+    assert.equal(curModel.reasoningEffort, 'high');
+    assert.equal(ctx.nsTeam!.getOrchestratorState('adaptive-root').phase, 'planning');
+    assert.ok(ctx.tools.checkGuards({ name: 'edit_file', agent: fakeRoot, arguments: {} } as never));
+
+    // Turn 2 with complex prompt stays in planning on high Planner and blocks edit_file until handoff_plan
+    await ctx.serial('agent/inbox/inserted' as never, {
+      agent: fakeRoot,
+      message: { id: 'msg-plan-2', role: 'user', content: [{ type: 'text', text: 'Architect multi-file cache across src/a.ts and src/b.ts' }] },
+    } as never);
+    await ctx.waterfall(
+      'agent/pre-step',
+      {
+        agent: fakeRoot,
+        messages: [{ id: 'msg-plan-2' as never, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'Architect multi-file cache across src/a.ts and src/b.ts' }] } as never],
+        turn: 2,
+        step: 1,
+        signal: AbortSignal.timeout(2000),
+        modelSelection: curModel as never,
+      },
+      async () => ({ kind: 'enter' as const, messages: [] }),
+    );
+    assert.equal(curModel.reasoningEffort, 'high');
+    assert.equal(ctx.nsTeam!.getOrchestratorState('adaptive-root').phase, 'planning');
+    assert.equal(ctx.nsTeam!.getOrchestratorState('adaptive-root').fastPathTurn, false);
+    assert.ok(ctx.tools.checkGuards({ name: 'edit_file', agent: fakeRoot, arguments: {} } as never));
+  } finally {
+    await fiber.dispose();
   }
 });

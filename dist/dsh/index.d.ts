@@ -7,6 +7,9 @@ export type OrchestratorPhase = 'planning' | 'executing';
 export interface OrchestratorSessionState {
     sessionId: string;
     phase: OrchestratorPhase;
+    fastPathTurn?: boolean;
+    manualPlanPinned?: boolean;
+    lastClassifiedMsgKey?: string;
     activeCardId?: string;
     planSummary?: string;
     replanIf?: string;
@@ -23,6 +26,7 @@ export interface OrchestratorSessionState {
 }
 export interface PluginConfig {
     strategy: SwitchyardStrategy;
+    adaptiveFastPath?: boolean;
     maxAdvisorCallsPerCard: number;
     requireHumanReviewApproval: boolean;
     defaultTestCommand: string;
@@ -41,6 +45,7 @@ export interface PluginConfig {
 }
 export declare const Config: z<Schemastery.ObjectS<NoInfer<{
     strategy: z<"orchestrator" | "switchyard-stage" | "subagent-team" | "hybrid", "orchestrator" | "switchyard-stage" | "subagent-team" | "hybrid", "defined">;
+    adaptiveFastPath: z<boolean, boolean, "defined">;
     maxAdvisorCallsPerCard: z<number, number, "defined">;
     requireHumanReviewApproval: z<boolean, boolean, "defined">;
     defaultTestCommand: z<string, string, "defined">;
@@ -58,6 +63,7 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
     twoStrikeThreshold: z<number, number, "defined">;
 }>>, Schemastery.ObjectT<NoInfer<{
     strategy: z<"orchestrator" | "switchyard-stage" | "subagent-team" | "hybrid", "orchestrator" | "switchyard-stage" | "subagent-team" | "hybrid", "defined">;
+    adaptiveFastPath: z<boolean, boolean, "defined">;
     maxAdvisorCallsPerCard: z<number, number, "defined">;
     requireHumanReviewApproval: z<boolean, boolean, "defined">;
     defaultTestCommand: z<string, string, "defined">;
